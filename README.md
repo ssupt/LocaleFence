@@ -4,7 +4,7 @@ LocaleFence is a userscript for hiding posts and automatically blocking X accoun
 
 > Automatic blocking creates real blocks on your X account and remains enabled across reloads until you turn it off. Review your selected locations before enabling it.
 
-**[Install LocaleFence](https://raw.githubusercontent.com/ssupt/LocaleFence/main/localefence.user.js)**
+**[Install LocaleFence](https://greasyfork.org/en/scripts/585483-localefence-for-x)**
 
 <p align="center">
   <img src="screenshot.png" alt="LocaleFence country filters and automatic-blocking controls" width="440">
@@ -25,7 +25,7 @@ LocaleFence is a userscript for hiding posts and automatically blocking X accoun
 ## Install
 
 1. Install a userscript manager such as Tampermonkey or Violentmonkey.
-2. Open **[Install LocaleFence](https://raw.githubusercontent.com/ssupt/LocaleFence/main/localefence.user.js)** and confirm the installation.
+2. Open **[Install LocaleFence](https://greasyfork.org/en/scripts/585483-localefence-for-x)** and confirm the installation.
 3. Open or reload [x.com](https://x.com/).
 
 LocaleFence adds a **LocaleFence** item to X's navigation.
