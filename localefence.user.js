@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LocaleFence for X
 // @namespace    https://github.com/ssupt/LocaleFence
-// @version      1.0.0
+// @version      1.0.1
 // @description  Hide posts and block accounts based on their X account location
 // @author       ssupt
 // @license      GPL-3.0-only
@@ -69,12 +69,22 @@
   );
   let processing = false;
   let blockProcessing = false;
-  let blockEnabled = readStorage("localefence.blockEnabled") === "true";
+  const blockEnabledStorageKey = "localefence.blockEnabled";
+  const blockOwnerStorageKey = "localefence.blockOwnerRestId";
+  let blockEnabled = readStorage(blockEnabledStorageKey) === "true";
+  let blockOwnerRestId = readStorage(blockOwnerStorageKey) || "";
+  const invalidStoredBlockOwner = blockEnabled && (!blockOwnerRestId || blockOwnerRestId !== getOwnRestId());
+  if (invalidStoredBlockOwner) {
+    blockEnabled = false;
+    writeStorage(blockEnabledStorageKey, false);
+  }
   let blockPaused = false;
   let blockSuccessCount = 0;
   const storedTotalBlocked = readStorage("localefence.totalBlocked");
   let totalBlockedCount = Number(storedTotalBlocked) || 0;
-  let blockErrorMessage = "";
+  let blockErrorMessage = invalidStoredBlockOwner
+    ? "Automatic blocking was turned off. Enable it again for this X account."
+    : "";
   let lookupStatusMessage = "";
   let lookupStatusError = false;
   let queueTimer = null;
@@ -871,6 +881,52 @@
     blockQueue.length = 0;
     queuedBlockIds.clear();
   };
+  const disableBlocking = (message = "") => {
+    blockEnabled = false;
+    blockPaused = false;
+    blockErrorMessage = message;
+    writeStorage(blockEnabledStorageKey, false);
+    clearBlockQueue();
+    lookupRecords.forEach((record) => {
+      if (record.status === "awaiting_block") removeLookupRecord(record.username);
+    });
+    renderActionControls();
+  };
+  const ensureBlockOwner = () => {
+    if (!blockEnabled) return false;
+    if (blockOwnerRestId && blockOwnerRestId === getOwnRestId()) return true;
+    const message = "Automatic blocking was turned off because the signed-in X account changed.";
+    disableBlocking(message);
+    showToast(message, { error: true });
+    return false;
+  };
+  globalThis.addEventListener("storage", (event) => {
+    if (event.key === null) {
+      blockOwnerRestId = "";
+      selectedLocations.clear();
+      excludedUserIds.clear();
+      if (blockEnabled) disableBlocking();
+      refreshProcessedAccounts();
+    } else if (event.key === blockOwnerStorageKey) {
+      blockOwnerRestId = event.newValue || "";
+      if (blockEnabled) ensureBlockOwner();
+    } else if (event.key === blockEnabledStorageKey && event.newValue !== "true") {
+      if (blockEnabled) disableBlocking();
+    } else if (event.key === "localefence.locations") {
+      selectedLocations.clear();
+      (event.newValue || "").split("\n").map(resolveCountryAlias).filter(Boolean).forEach((location) => {
+        selectedLocations.add(location);
+      });
+      refreshProcessedAccounts();
+      resumeAwaitingBlocks();
+      renderLocationStats();
+    } else if (event.key === "localefence.excludedUserIds") {
+      excludedUserIds.clear();
+      (event.newValue || "").split("\n").filter(Boolean).forEach((restId) => excludedUserIds.add(restId));
+      refreshProcessedAccounts();
+      renderActionControls();
+    }
+  });
   const pauseBlocking = (message) => {
     blockPaused = true;
     blockErrorMessage = message;
@@ -922,7 +978,11 @@
     const name = aboutUsers.get(restId)?.name?.trim();
     return name ? `${name} (@${username})` : `@${username}`;
   };
-  const excludeAndUnblock = async ({ country, historyId, restId, username }) => {
+  const excludeAndUnblock = async ({ country, historyId, ownerRestId, restId, username }) => {
+    if (!ownerRestId || ownerRestId !== getOwnRestId()) {
+      showToast("Switch back to the X account that created this block before changing it.", { error: true });
+      return false;
+    }
     const label = getAccountLabel(restId, username);
     excludedUserIds.add(restId);
     saveExcludedUserIds();
@@ -942,6 +1002,7 @@
       );
     }
     renderActionControls();
+    return true;
   };
   const processBlockQueue = async () => {
     if (blockProcessing) return;
@@ -956,10 +1017,11 @@
         }
         const waitTime = blockRequestDelayMs - (Date.now() - lastBlockRequestTime);
         if (waitTime > 0) await wait(waitTime);
-        if (!blockEnabled) break;
+        if (!ensureBlockOwner()) break;
         const latestCached = getCachedAccount(username);
         if (!latestCached || !isCountryBlocked(latestCached.country) || excludedUserIds.has(restId)) continue;
         try {
+          const requestOwnerRestId = blockOwnerRestId;
           await blockAccount(restId);
           lastBlockRequestTime = Date.now();
           blockedIds.add(restId);
@@ -970,6 +1032,7 @@
           markFeedAccount(username, "Blocked");
           const historyEntry = await addBlockHistoryEntry({
             restId,
+            ownerRestId: requestOwnerRestId,
             username,
             name: aboutUsers.get(restId)?.name?.trim() || "",
             country,
@@ -982,7 +1045,13 @@
           showToast(`${label} was blocked`, {
             actionLabel: "Exclude",
             country,
-            onAction: () => excludeAndUnblock({ country, historyId: historyEntry?.id, restId, username }),
+            onAction: () => excludeAndUnblock({
+              country,
+              historyId: historyEntry?.id,
+              ownerRestId: historyEntry?.ownerRestId,
+              restId,
+              username,
+            }),
             postText: tweetText,
             targetUrl: tweetUrl,
           });
@@ -1014,7 +1083,7 @@
     return { tweetText, tweetUrl };
   };
   const enqueueBlock = (username, country, tweet, savedSnapshot = null) => {
-    if (!isCountryBlocked(country)) return false;
+    if (!isCountryBlocked(country) || !ensureBlockOwner()) return false;
     const restId = screenNames.get(usernameKey(username));
     if (!restId || restId === getOwnRestId()) return false;
     if (excludedUserIds.has(restId)) {
@@ -1031,7 +1100,12 @@
   const resumeAwaitingBlocks = () => {
     lookupRecords.forEach((record) => {
       if (record.status !== "awaiting_block" || !record.country) return;
-      if (!blockEnabled || !isLocationMatched(record.country) || (record.restId && excludedUserIds.has(record.restId))) {
+      if (
+        !blockEnabled ||
+        record.ownerRestId !== blockOwnerRestId ||
+        !isLocationMatched(record.country) ||
+        (record.restId && excludedUserIds.has(record.restId))
+      ) {
         removeLookupRecord(record.username);
         return;
       }
@@ -1065,6 +1139,7 @@
         attempts: 0,
         lastError: "",
         country,
+        ownerRestId: blockOwnerRestId,
         restId,
         name: aboutUsers.get(restId)?.name?.trim() || "",
       });
@@ -2356,7 +2431,7 @@
           post.title = "Open triggering post";
         }
         header.append(flag, account, status);
-        if (entry.status !== "excluded") {
+        if (entry.status !== "excluded" && entry.ownerRestId === getOwnRestId()) {
           const action = document.createElement("button");
           action.dataset.historyAction = "true";
           action.type = "button";
@@ -2364,12 +2439,13 @@
           action.addEventListener("click", async () => {
             action.disabled = true;
             action.textContent = "Working…";
-            await excludeAndUnblock({
+            if (!(await excludeAndUnblock({
               country: entry.country,
               historyId: entry.id,
+              ownerRestId: entry.ownerRestId,
               restId: entry.restId,
               username: entry.username,
-            });
+            }))) renderHistory();
           });
           header.appendChild(action);
         }
@@ -2609,9 +2685,15 @@
       if (blockToggle.checked) {
         if (!selectedLocations.size) {
           blockToggle.checked = false;
-          blockEnabled = false;
-          writeStorage("localefence.blockEnabled", false);
+          disableBlocking();
           showToast("Select at least one country or region first", { error: true });
+          return;
+        }
+        const ownerRestId = getOwnRestId();
+        if (!ownerRestId) {
+          blockToggle.checked = false;
+          disableBlocking("Automatic blocking requires a signed-in X account.");
+          showToast(blockErrorMessage, { error: true });
           return;
         }
         const confirmed = globalThis.confirm(
@@ -2621,23 +2703,17 @@
           blockToggle.checked = false;
           return;
         }
+        blockOwnerRestId = ownerRestId;
+        writeStorage(blockOwnerStorageKey, blockOwnerRestId);
         blockEnabled = true;
         blockPaused = false;
         blockErrorMessage = "";
-        writeStorage("localefence.blockEnabled", true);
+        writeStorage(blockEnabledStorageKey, true);
         refreshProcessedAccounts();
         resumeAwaitingBlocks();
         updateActionControls();
       } else {
-        blockEnabled = false;
-        blockPaused = false;
-        blockErrorMessage = "";
-        writeStorage("localefence.blockEnabled", false);
-        clearBlockQueue();
-        lookupRecords.forEach((record) => {
-          if (record.status === "awaiting_block") removeLookupRecord(record.username);
-        });
-        updateActionControls();
+        disableBlocking();
       }
     });
     document.addEventListener("keydown", (event) => {

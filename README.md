@@ -63,14 +63,6 @@ The **Clear cache**, **Clear queue**, and **Clear history** controls remove thos
 - Rate limits can delay decisions; unresolved accounts remain visible in the lookup queue.
 - Excluding an account requires a successful unblock request to undo an existing block.
 
-## Development
-
-The project intentionally stays as a single dependency-free userscript. Run a syntax check before publishing:
-
-```sh
-node --check localefence.user.js
-```
-
 ## License
 
 [GNU General Public License v3.0 only](LICENSE). This software is provided without warranty.
