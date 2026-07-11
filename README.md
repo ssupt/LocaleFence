@@ -21,6 +21,7 @@ LocaleFence is a userscript for hiding posts and automatically blocking X accoun
 - Keep a persistent queue when X temporarily cannot resolve an account location.
 - Keep a local history of confirmed automatic blocks and their triggering posts.
 - Cache successful location lookups for 28 days to reduce requests and rate limits.
+- Revalidate an account's current username, ID, and location immediately before automatic blocking.
 
 ## Install
 
@@ -39,10 +40,13 @@ LocaleFence adds a **LocaleFence** item to X's navigation.
 5. Use **Settings** to disable or re-enable notifications.
 
 Automatic blocking remains enabled across X reloads until you turn it off. Changing selected locations changes which accounts match while it is enabled.
+Adding a location while automatic blocking is enabled requires confirmation because matching accounts already in the feed may be processed immediately.
 
 Selecting a continent includes all of its member countries. You can also select individual countries independently. Continent membership follows the [UN M49 geographic classification](https://unstats.un.org/unsd/methodology/m49/overview/).
 
 When X rate-limits a location lookup, LocaleFence retains the account and post snapshot, retries with backoff, and exposes the pending item in the lookup queue. A non-matching account leaves the queue after resolution. A matching account remains until X confirms the block, then moves to block history.
+
+Cached location data may be used to hide posts, but LocaleFence does not use a cached username-to-account mapping for a block request. It performs a fresh lookup first and remembers confirmed blocks per signed-in X account to avoid repeating the request after a reload.
 
 ## Data and privacy
 
@@ -50,11 +54,11 @@ LocaleFence runs entirely in the browser. It does not use an external server or 
 
 It stores the following data locally:
 
-- Selected locations, settings, exclusions, and the lifetime block count in `localStorage`.
+- Selected locations, settings, exclusions, the lifetime block count, and confirmed owner/account block IDs in `localStorage`.
 - Resolved account IDs, names, locations, and cache timestamps in IndexedDB.
 - Pending lookup records and up to 250 confirmed block-history entries in IndexedDB.
 
-The **Clear cache**, **Clear queue**, and **Clear history** controls remove those respective datasets. Clearing history does not reset the lifetime block counter or undo X blocks.
+The **Clear cache**, **Clear queue**, and **Clear history** controls remove those respective datasets. Clearing history does not reset the lifetime block counter, forget confirmed block IDs, or undo X blocks.
 
 ## Limitations
 
@@ -62,6 +66,7 @@ The **Clear cache**, **Clear queue**, and **Clear history** controls remove thos
 - X's private web APIs can change without notice and temporarily break lookups or blocking.
 - Rate limits can delay decisions; unresolved accounts remain visible in the lookup queue.
 - Excluding an account requires a successful unblock request to undo an existing block.
+- Blocks manually changed outside LocaleFence are not detected; confirmed block IDs remain remembered until site storage is cleared or LocaleFence successfully unblocks the account.
 
 ## License
 
