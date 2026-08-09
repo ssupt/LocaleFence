@@ -1,10 +1,12 @@
-# LocaleFence
+# LocaleFence - Country Filter for X
 
-LocaleFence is a userscript for hiding posts and automatically blocking X accounts based on the location shown in X's **About this account** data.
+LocaleFence shows the country from X's **About this account** data beside accounts in the feed. You can use that context to hide matching posts or, after an explicit confirmation, automatically block matching accounts.
 
-> Automatic blocking creates real blocks on your X account and remains enabled across reloads until you turn it off. Review your selected locations before enabling it.
+It is local-first: there is no LocaleFence server, analytics, or external data service.
 
-**[Install LocaleFence](https://greasyfork.org/en/scripts/585483-localefence-for-x)**
+> Automatic blocking creates real blocks on your X account. Review the selected locations before enabling it. X's country label can be missing or inaccurate and is not proof of a person's nationality or current physical location.
+
+**[Install LocaleFence for X from Greasy Fork](https://greasyfork.org/en/scripts/585483-localefence-for-x)**
 
 <p align="center">
   <img src="screenshot.png" alt="LocaleFence country filters and automatic-blocking controls" width="440">
@@ -12,61 +14,135 @@ LocaleFence is a userscript for hiding posts and automatically blocking X accoun
 
 ## Features
 
+- Show a country flag beside encountered X accounts.
 - Select individual countries, X regions, or whole continents.
 - Hide matching posts without blocking their authors.
-- Automatically block matching accounts as their posts appear in the feed.
+- Optionally block matching accounts as their posts appear.
 - Show the account, flag, and triggering post in each block notification.
-- Enable or disable notifications from the Settings tab. They are enabled by default.
 - Exclude and immediately unblock an account from its notification or block-history entry.
-- Keep a persistent queue when X temporarily cannot resolve an account location.
-- Keep a local history of confirmed automatic blocks and their triggering posts.
+- Keep lookups that cannot proceed in a persistent, inspectable queue with rate-limit backoff.
+- Keep up to 250 confirmed block-history entries and their triggering post snapshots locally.
 - Cache successful location lookups for 28 days to reduce requests and rate limits.
-- Revalidate an account's current username, ID, and location immediately before automatic blocking.
+- Recover from X `AboutAccountQuery` identifier changes using observed same-origin requests and a current fallback.
+- Revalidate the current username, account ID, and location immediately before every automatic block.
+- Serialize block requests across open X tabs and remember confirmed blocks per signed-in X account.
+- Reset all locally stored LocaleFence data from Settings.
 
-## Install
+## Install the userscript
 
 1. Install a userscript manager such as Tampermonkey or Violentmonkey.
-2. Open **[Install LocaleFence](https://greasyfork.org/en/scripts/585483-localefence-for-x)** and confirm the installation.
+2. Open **[LocaleFence on Greasy Fork](https://greasyfork.org/en/scripts/585483-localefence-for-x)** and confirm the installation.
 3. Open or reload [x.com](https://x.com/).
 
-LocaleFence adds a **LocaleFence** item to X's navigation.
+LocaleFence adds an item to X's navigation. On narrow screens it uses a floating filter button and a full-screen responsive panel.
+
+The userscript keeps its original metadata name, **LocaleFence for X**, so existing Greasy Fork installations continue to be recognized as the same script. The browser-extension title is **LocaleFence - Country Filter for X**.
+
+## Try the browser extensions
+
+The repository now builds minimal Manifest V3 packages for Chromium and Firefox. Until signed store releases are available, build them locally:
+
+```sh
+npm test
+npm run build:extension
+```
+
+Open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and select `dist/localefence-chromium`.
+
+The Firefox build is in `dist/localefence-firefox`. Test it on desktop with `web-ext run` or follow the Android steps below before AMO submission.
+
+Do not run both distributions at once. LocaleFence detects this situation and allows only the first copy to start, but uninstalling or disabling the redundant copy avoids update-order surprises.
+
+## Test Firefox for Android
+
+1. Install an up-to-date Firefox for Android on the phone.
+2. Enable Android **Developer options** and **USB debugging**, connect the phone to this computer, and approve the debugging prompt.
+3. Confirm that ADB can see it:
+
+   ```sh
+   adb devices -l
+   ```
+
+4. Build the current Firefox package:
+
+   ```sh
+   npm run build:extension
+   ```
+
+5. Keep at least one Firefox tab open, then temporarily install LocaleFence. Replace `DEVICE_SERIAL` with the value reported by ADB:
+
+   ```sh
+   npx --yes web-ext@latest run \
+     --source-dir dist/localefence-firefox \
+     --target firefox-android \
+     --android-device DEVICE_SERIAL \
+     --firefox-apk org.mozilla.firefox
+   ```
+
+   Use `org.mozilla.firefox_beta` for Firefox Beta or `org.mozilla.fenix` for Firefox Nightly.
+
+6. In Firefox on the phone, sign in at `x.com`, reload the page, and open the floating LocaleFence filter button. Test flags and hiding before enabling automatic blocking.
+7. Keep the terminal command running during the test. Press **Ctrl+C** when finished; this is a temporary development installation.
+
+For debugging, connect Firefox Desktop through `about:debugging`, select the Android device, and inspect its main process or the `x.com` tab.
 
 ## Use
 
-1. Open **LocaleFence** and select the locations you want to match.
+1. Open **LocaleFence** and select the locations to match.
 2. Enable **Hide matching posts**, **Automatically block accounts**, or both.
-3. Use **Lookup queue** to inspect unresolved or failed location checks.
-4. Use **Block history** to review confirmed blocks and open their triggering posts.
-5. Use **Settings** to disable or re-enable notifications.
+3. Use **Lookup queue** to inspect unresolved or failed checks. Removing an item cancels its block if the request has not started.
+4. Use **Block history** to review confirmed actions and open their triggering posts.
+5. Use **Settings** to manage notifications or erase all LocaleFence data.
 
-Automatic blocking remains enabled across X reloads until you turn it off. Changing selected locations changes which accounts match while it is enabled.
-Adding a location while automatic blocking is enabled requires confirmation because matching accounts already in the feed may be processed immediately.
+Automatic blocking remains enabled across X reloads until you turn it off. If a block request fails or times out, LocaleFence keeps the safety pause across reloads; turn blocking off and on only when you deliberately want to retry. Adding a location while blocking is active also requires confirmation because matching accounts already in the feed may be processed immediately.
 
-Selecting a continent includes all of its member countries. You can also select individual countries independently. Continent membership follows the [UN M49 geographic classification](https://unstats.un.org/unsd/methodology/m49/overview/).
+Selecting a continent includes all of its member countries. Individual countries can be selected independently. Continent membership follows the [UN M49 geographic classification](https://unstats.un.org/unsd/methodology/m49/overview/).
 
-When X rate-limits a location lookup, LocaleFence retains the account and post snapshot, retries with backoff, and exposes the pending item in the lookup queue. A non-matching account leaves the queue after resolution. A matching account remains until X confirms the block, then moves to block history.
+Under normal quota, location checks and confirmed block actions proceed immediately without a fixed or adaptive pacing delay. Location checks use the same read-only POST transport as LocaleFence 1.1.0, with GET retained as a compatibility fallback only if X rejects POST. Terminal profile and GraphQL errors are not retried repeatedly. When X actually rate-limits a lookup, LocaleFence retains the account and post snapshot, honors X's quota-reset headers, and persists one shared cooldown across reloads and open X tabs. Lookups resume only while X is visible. A non-matching account leaves the queue after resolution. A matching account remains until X confirms the block, then moves to block history.
 
-Cached location data may be used to hide posts, but LocaleFence does not use a cached username-to-account mapping for a block request. It performs a fresh lookup first and remembers confirmed blocks per signed-in X account to avoid repeating the request after a reload.
+Cached location data may be used to hide posts. It is never trusted as username-to-account proof for blocking: LocaleFence performs a fresh identity lookup immediately before the request.
+
+## Browser and Android direction
+
+- **Chrome, Edge, and other Chromium desktop browsers:** use the Manifest V3 package; Chrome Web Store publication is the next distribution milestone.
+- **Android:** Chrome for Android cannot install extensions. The planned supported route is the same WebExtension published for Firefox for Android. It will work on `x.com` in Firefox, not inside the native X app.
 
 ## Data and privacy
 
-LocaleFence runs entirely in the browser. It does not use an external server or send account data outside `x.com`.
+LocaleFence reads only the X page content needed for its visible features and sends requests only to `x.com` using the active X session. It does not use an external server.
 
-It stores the following data locally:
+It stores the following in browser storage associated with `x.com`:
 
-- Selected locations, settings, exclusions, the lifetime block count, and confirmed owner/account block IDs in `localStorage`.
-- Resolved account IDs, names, locations, and cache timestamps in IndexedDB.
-- Pending lookup records and up to 250 confirmed block-history entries in IndexedDB.
+- selected locations, settings, exclusions, counters, pause state, and remembered owner/account block IDs in `localStorage`;
+- resolved account IDs, names, locations, and cache timestamps in IndexedDB;
+- pending lookup records and up to 250 confirmed block-history entries in IndexedDB.
 
-The **Clear cache**, **Clear queue**, and **Clear history** controls remove those respective datasets. Clearing history does not reset the lifetime block counter, forget confirmed block IDs, or undo X blocks.
+The individual clear controls remove their named datasets. **Settings → Reset LocaleFence** removes all LocaleFence browser data but does not undo blocks already held by X. Uninstalling the extension alone may leave `x.com` site data, so use Reset or clear X site data when complete deletion is wanted.
+
+See the full [privacy policy](PRIVACY.md).
 
 ## Limitations
 
-- Locations come from X's account metadata and may be missing or inaccurate.
-- X's private web APIs can change without notice and temporarily break lookups or blocking.
-- Rate limits can delay decisions; unresolved accounts remain visible in the lookup queue.
-- Excluding an account requires a successful unblock request to undo an existing block.
-- Blocks manually changed outside LocaleFence are not detected; confirmed block IDs remain remembered until site storage is cleared or LocaleFence successfully unblocks the account.
+- X account locations may be missing, broad, stale, or inaccurate.
+- X's private web APIs can change without notice. LocaleFence can recover from query-identifier rotation, but schema or action-endpoint changes can still break features temporarily.
+- A timed-out action has an unknown server result, so automatic blocking pauses for review.
+- Excluding an account requires a successful X unblock request to undo an existing block.
+- Blocks changed outside LocaleFence are not detected; remembered IDs remain until LocaleFence unblocks the account or local data is reset.
+- Browser tools cannot modify the native X Android app.
+
+## Development
+
+The project has no runtime dependencies. Run the safety and extension-metadata checks with:
+
+```sh
+npm test
+```
+
+Build the unpacked Chromium release directory with:
+
+```sh
+npm run build:extension
+```
 
 ## License
 

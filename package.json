@@ -1,0 +1,14 @@
+{
+  "name": "localefence",
+  "version": "1.2.3",
+  "private": true,
+  "description": "Local-first country context and feed controls for X",
+  "scripts": {
+    "build:extension": "node scripts/build-extension.mjs",
+    "test": "node localefence.test.js && node scripts/validate-extension.mjs"
+  },
+  "license": "GPL-3.0-only",
+  "engines": {
+    "node": ">=20"
+  }
+}

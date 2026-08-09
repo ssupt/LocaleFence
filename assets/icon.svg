@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">LocaleFence</title>
+  <desc id="desc">A white location filter on a blue rounded square</desc>
+  <defs>
+    <linearGradient id="background" x1="64" y1="48" x2="448" y2="464" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1D9BF0"/>
+      <stop offset="1" stop-color="#0A66C2"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="#0F1419"/>
+  <rect x="32" y="32" width="448" height="448" rx="92" fill="url(#background)"/>
+  <path d="M112 132c0-13.3 10.7-24 24-24h240c13.3 0 24 10.7 24 24 0 5.9-2.2 11.6-6.1 16l-91.9 102.1V344c0 9.1-5.1 17.4-13.2 21.5l-54 27c-7.5 3.7-16.3 3.3-23.4-1.1A24 24 0 0 1 200 371v-120.9L118.1 148a24 24 0 0 1-6.1-16Zm75.9 24 51.5 64.2A40 40 0 0 1 248 245v87.2l6-3v-84.2a40 40 0 0 1 10.6-27.2L320.2 156H187.9Z" fill="#fff"/>
+  <circle cx="366" cy="358" r="58" fill="#00BA7C" stroke="#fff" stroke-width="16"/>
+  <circle cx="366" cy="358" r="16" fill="#fff"/>
+</svg>

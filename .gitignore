@@ -1,0 +1,28 @@
+# Generated extension packages and release archives
+dist/
+web-ext-artifacts/
+*.crx
+*.xpi
+*.zip
+
+# Dependencies, test output, and local browser profiles
+node_modules/
+coverage/
+*.log
+.web-ext-profile/
+browser-profile/
+
+# Local planning and agent/tool state
+docs/
+.agents/
+.codex/
+
+# Secrets and signing material
+.env
+.env.*
+!.env.example
+*.pem
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

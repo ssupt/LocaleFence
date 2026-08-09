@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "LocaleFence - Country Filter for X",
+  "short_name": "LocaleFence",
+  "version": "1.2.3",
+  "description": "See X account countries, hide matching posts, and optionally block matching accounts - all locally.",
+  "minimum_chrome_version": "105",
+  "icons": {
+    "16": "extension/icons/icon-16.png",
+    "32": "extension/icons/icon-32.png",
+    "48": "extension/icons/icon-48.png",
+    "128": "extension/icons/icon-128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://x.com/*"],
+      "js": ["localefence.user.js"],
+      "run_at": "document_start"
+    }
+  ]
+}
