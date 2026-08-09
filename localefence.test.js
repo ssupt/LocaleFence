@@ -11,9 +11,25 @@ const instrumentedSource = source.replace(
   `
   globalThis.__localefenceTest = {
     getBlockEnabled: () => blockEnabled,
+    getBlockPaused: () => blockPaused,
+    getBlockQueue: () => blockQueue.map(({ restId, username }) => ({ restId, username })),
+    getAboutQueryId: () => aboutQueryId,
+    getLookupBackoffUntil: () => lookupBackoffUntil,
+    getLookupRecord: (username) => lookupRecords.get(usernameKey(username)),
+    getRuntimeVersion: () => runtimeVersion,
     getSelectedLocations: () => [...selectedLocations],
+    applyPostVisibility,
+    enqueueBlock,
+    fetchCountry,
     isKnownBlocked,
+    pauseBlocking,
+    rememberLookupRecord,
+    removeLookupRecord,
+    resetLocaleFenceData,
+    resolveLocaleFenceMount,
     resolveCountryAlias,
+    scheduleLookupRetry,
+    withLookupRequestLock,
     enqueue,
     seedCachedUser: (user) => {
       aboutUsers.set(user.restId, user);
@@ -23,14 +39,27 @@ const instrumentedSource = source.replace(
 })();`,
 );
 
-const boot = ({ currentOwner, fetchImpl, storedBlockEnabled = "true", storedBlockedAccounts, storedOwner }) => {
-  const values = new Map([
+const boot = ({
+  currentOwner,
+  fetchImpl,
+  navigatorImpl,
+  runtimeDataset,
+  storageValues,
+  storedBlockEnabled = "true",
+  storedBlockedAccounts,
+  storedOwner,
+}) => {
+  const values = storageValues || new Map();
+  const defaults = [
     ["localefence.blockEnabled", storedBlockEnabled],
     ["localefence.locations", "Italy"],
     ["localefence.notificationsEnabled", "false"],
     ...(storedBlockedAccounts ? [["localefence.blockedAccounts", storedBlockedAccounts]] : []),
     ...(storedOwner ? [["localefence.blockOwnerRestId", storedOwner]] : []),
-  ]);
+  ];
+  defaults.forEach(([key, value]) => {
+    if (!values.has(key)) values.set(key, value);
+  });
   const listeners = new Map();
   const makeNode = () => ({
     append() {},
@@ -46,6 +75,7 @@ const boot = ({ currentOwner, fetchImpl, storedBlockEnabled = "true", storedBloc
     style: {},
   });
   const documentElement = makeNode();
+  Object.assign(documentElement.dataset, runtimeDataset || {});
   documentElement.lang = "en";
   const document = {
     body: null,
@@ -55,6 +85,7 @@ const boot = ({ currentOwner, fetchImpl, storedBlockEnabled = "true", storedBloc
     head: makeNode(),
     querySelector() { return null; },
     querySelectorAll() { return []; },
+    readyState: "complete",
   };
   const context = {
     clearTimeout,
@@ -64,6 +95,9 @@ const boot = ({ currentOwner, fetchImpl, storedBlockEnabled = "true", storedBloc
     location: { origin: "https://x.com" },
     localStorage: {
       getItem: (key) => values.get(key) ?? null,
+      key: (index) => [...values.keys()][index] ?? null,
+      get length() { return values.size; },
+      removeItem: (key) => values.delete(key),
       setItem: (key, value) => values.set(key, String(value)),
     },
     MutationObserver: class { observe() {} },
@@ -72,6 +106,7 @@ const boot = ({ currentOwner, fetchImpl, storedBlockEnabled = "true", storedBloc
     URL,
     URLSearchParams,
   };
+  if (navigatorImpl) context.navigator = navigatorImpl;
   if (fetchImpl) context.fetch = fetchImpl;
   context.globalThis = context;
   context.addEventListener = (type, listener) => listeners.set(type, listener);
@@ -79,6 +114,8 @@ const boot = ({ currentOwner, fetchImpl, storedBlockEnabled = "true", storedBloc
   return {
     blockEnabled: () => context.__localefenceTest.getBlockEnabled(),
     hooks: context.__localefenceTest,
+    runtime: () => documentElement.dataset.localefenceRuntime,
+    stored: (key) => values.get(key) ?? null,
     storage: (key, newValue) => {
       if (newValue == null) values.delete(key);
       else values.set(key, String(newValue));
@@ -114,12 +151,107 @@ const waitFor = async (predicate) => {
   assert.fail("Timed out waiting for LocaleFence's asynchronous queue");
 };
 
+const testImmediateNormalLookups = async () => {
+  const requestTimes = [];
+  const resetAt = Math.floor(Date.now() / 1000) + 15 * 60;
+  const fetchImpl = async (url) => {
+    if (!url.includes("AboutAccountQuery")) throw new Error(`Unexpected request: ${url}`);
+    requestTimes.push(Date.now());
+    const variables = JSON.parse(new URL(url).searchParams.get("variables"));
+    return {
+      headers: {
+        get(name) {
+          if (name === "x-rate-limit-remaining") return "99";
+          if (name === "x-rate-limit-reset") return String(resetAt);
+          return null;
+        },
+      },
+      json: () => Promise.resolve({
+        data: {
+          user_result_by_screen_name: {
+            result: {
+              rest_id: variables.screenName === "Alice" ? "2" : "3",
+              core: { name: variables.screenName, screen_name: variables.screenName },
+              about_profile: { account_based_in: "France" },
+            },
+          },
+        },
+      }),
+      ok: true,
+      status: 200,
+    };
+  };
+  const app = boot({ currentOwner: "1", fetchImpl, storedBlockEnabled: "false" });
+  const makeContainer = () => ({
+    appendChild() {},
+    querySelector() { return null; },
+  });
+  const makeTweet = () => ({
+    closest() { return null; },
+    isConnected: true,
+    querySelector() { return null; },
+  });
+  app.hooks.enqueue("Alice", makeContainer(), makeTweet());
+  app.hooks.enqueue("Bob", makeContainer(), makeTweet());
+  await waitFor(() => requestTimes.length === 2);
+  assert.ok(
+    requestTimes[1] - requestTimes[0] < 250,
+    "positive remaining quota must not introduce an artificial per-account delay",
+  );
+};
+
+const testAndroidMountRecovery = () => {
+  const app = boot({
+    currentOwner: "1",
+    runtimeDataset: { localefenceRuntime: "1.2.1" },
+    storedBlockEnabled: "false",
+  });
+  assert.equal(app.runtime(), "1.2.3", "a stale mobile-tab marker must not prevent reinjection");
+  assert.equal(app.hooks.getRuntimeVersion(), "1.2.3");
+  const body = {};
+  assert.equal(
+    app.hooks.resolveLocaleFenceMount({
+      allowStandalone: false,
+      androidBrowser: true,
+      body,
+      compactViewport: false,
+      nav: null,
+    }).mount,
+    body,
+    "Android must mount without waiting for X's navigation DOM",
+  );
+  assert.equal(
+    app.hooks.resolveLocaleFenceMount({
+      allowStandalone: false,
+      androidBrowser: false,
+      body,
+      compactViewport: false,
+      nav: null,
+    }).mount,
+    null,
+  );
+  assert.equal(
+    app.hooks.resolveLocaleFenceMount({
+      allowStandalone: true,
+      androidBrowser: false,
+      body,
+      compactViewport: false,
+      nav: null,
+    }).mount,
+    body,
+    "the mount watchdog must recover even when Firefox requests the desktop site",
+  );
+};
+
 const testFreshIdentityAndDurableDeduplication = async () => {
   let aboutRequests = 0;
+  const aboutRequestMethods = [];
   const blockedRestIds = [];
   const fetchImpl = (url, options) => {
     if (url.includes("AboutAccountQuery")) {
       aboutRequests += 1;
+      aboutRequestMethods.push(options.method);
+      assert.match(url, /\/graphql\/zs_jFPFT78rBpXv9Z3U2YQ\/AboutAccountQuery/);
       return Promise.resolve({
         headers: { get: () => null },
         json: () => Promise.resolve({
@@ -201,11 +333,410 @@ const testFreshIdentityAndDurableDeduplication = async () => {
   reloadedApp.hooks.enqueue("Alice", makeContainer(), makeTweet());
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(aboutRequests, 1, "a remembered block should not trigger another identity lookup");
+  assert.deepEqual(aboutRequestMethods, ["POST"]);
   assert.deepEqual(blockedRestIds, ["2"], "a confirmed block must not be repeated after it is remembered");
 };
 
-testFreshIdentityAndDurableDeduplication()
-  .then(() => console.log("LocaleFence account-safety checks passed"))
+const testQueryIdRecovery = async () => {
+  const oldQueryId = "OldAboutQueryId123456";
+  const storageValues = new Map([
+    ["localefence.aboutQueryId", oldQueryId],
+    ["localefence.blockEnabled", "false"],
+    ["localefence.locations", "Italy"],
+    ["localefence.notificationsEnabled", "false"],
+  ]);
+  const requestedUrls = [];
+  const requestedMethods = [];
+  const fetchImpl = async (url, options) => {
+    requestedUrls.push(url);
+    requestedMethods.push(options.method);
+    if (url.includes(`/graphql/${oldQueryId}/`)) {
+      return { headers: { get: () => null }, ok: false, status: 404 };
+    }
+    return {
+      json: () => Promise.resolve({
+        data: {
+          user_result_by_screen_name: {
+            result: {
+              rest_id: "2",
+              core: { name: "Alice", screen_name: "Alice" },
+              about_profile: { account_based_in: "Italy" },
+            },
+          },
+        },
+      }),
+      ok: true,
+      status: 200,
+    };
+  };
+  const app = boot({ currentOwner: "1", fetchImpl, storageValues, storedBlockEnabled: "false" });
+  const result = await app.hooks.fetchCountry("Alice");
+  assert.equal(result.found, true);
+  assert.equal(requestedUrls.length, 2);
+  assert.match(requestedUrls[0], new RegExp(`/graphql/${oldQueryId}/`));
+  assert.match(requestedUrls[1], /\/graphql\/zs_jFPFT78rBpXv9Z3U2YQ\//);
+  assert.deepEqual(requestedMethods, ["POST", "POST"]);
+  assert.equal(app.hooks.getAboutQueryId(), "zs_jFPFT78rBpXv9Z3U2YQ");
+  assert.equal(app.stored("localefence.aboutQueryId"), "zs_jFPFT78rBpXv9Z3U2YQ");
+};
+
+const testPostTransportFallback = async () => {
+  const requestedMethods = [];
+  const fetchImpl = async (_url, options) => {
+    requestedMethods.push(options.method);
+    if (options.method === "POST") {
+      return { headers: { get: () => null }, ok: false, status: 405 };
+    }
+    return {
+      headers: { get: () => null },
+      json: () => Promise.resolve({
+        data: {
+          user_result_by_screen_name: {
+            result: {
+              rest_id: "2",
+              core: { name: "Alice", screen_name: "Alice" },
+              about_profile: { account_based_in: "Italy" },
+            },
+          },
+        },
+      }),
+      ok: true,
+      status: 200,
+    };
+  };
+  const app = boot({ currentOwner: "1", fetchImpl, storedBlockEnabled: "false" });
+  assert.equal((await app.hooks.fetchCountry("Alice")).found, true);
+  assert.deepEqual(requestedMethods, ["POST", "GET"]);
+};
+
+const testTerminalLookupFailuresDoNotRetry = async () => {
+  let httpRequests = 0;
+  const oldQueryId = "OldAboutQueryId123456";
+  const storageValues = new Map([["localefence.aboutQueryId", oldQueryId]]);
+  const httpFailureApp = boot({
+    currentOwner: "1",
+    fetchImpl: async () => {
+      httpRequests += 1;
+      return { headers: { get: () => null }, ok: false, status: 404 };
+    },
+    storageValues,
+    storedBlockEnabled: "false",
+  });
+  const httpFailure = await httpFailureApp.hooks.fetchCountry("MissingUser");
+  assert.equal(httpFailure.retryable, false);
+  assert.equal(httpRequests, 2, "query-ID recovery may retry once, never six times per profile");
+
+  let graphQlRequests = 0;
+  const graphQlFailureApp = boot({
+    currentOwner: "1",
+    fetchImpl: async () => {
+      graphQlRequests += 1;
+      return {
+        headers: { get: () => null },
+        json: () => Promise.resolve({ errors: [{ message: "User not found" }] }),
+        ok: true,
+        status: 200,
+      };
+    },
+    storedBlockEnabled: "false",
+  });
+  const graphQlFailure = await graphQlFailureApp.hooks.fetchCountry("MissingUser");
+  assert.equal(graphQlFailure.retryable, false);
+  assert.equal(graphQlRequests, 1);
+};
+
+const testRateLimitBackoffPersistence = async () => {
+  const storageValues = new Map();
+  const resetAt = Math.floor(Date.now() / 1000) + 120;
+  const fetchImpl = async () => ({
+    headers: {
+      get(name) {
+        if (name === "x-rate-limit-remaining") return "0";
+        if (name === "x-rate-limit-reset") return String(resetAt);
+        return null;
+      },
+    },
+    ok: false,
+    status: 429,
+  });
+  const app = boot({ currentOwner: "1", fetchImpl, storageValues, storedBlockEnabled: "false" });
+  const result = await app.hooks.fetchCountry("Alice");
+  assert.equal(result.status, 429);
+  assert.equal(result.retryable, true);
+  assert.ok(result.retryAfterMs > 115000 && result.retryAfterMs <= 121000);
+
+  app.hooks.rememberLookupRecord("Alice", {
+    tweetText: "Rate-limited post",
+    tweetUrl: "https://x.com/Alice/status/1",
+  });
+  assert.equal(app.hooks.scheduleLookupRetry("Alice", result), true);
+  assert.equal(app.hooks.getLookupRecord("Alice").status, "rate_limited");
+  assert.equal(app.hooks.getLookupRecord("Alice").attempts, 0, "HTTP 429 must not consume an account retry");
+  assert.ok(app.hooks.getLookupBackoffUntil() > Date.now() + 115000);
+  assert.equal(app.stored("localefence.lookupBackoffUntil"), String(app.hooks.getLookupBackoffUntil()));
+
+  const reloaded = boot({ currentOwner: "1", storageValues, storedBlockEnabled: "false" });
+  assert.equal(
+    reloaded.hooks.getLookupBackoffUntil(),
+    app.hooks.getLookupBackoffUntil(),
+    "the shared X quota pause must survive reloads",
+  );
+};
+
+const testNonRateLimitErrorIgnoresQuotaReset = async () => {
+  const resetAt = Math.floor(Date.now() / 1000) + 15 * 60;
+  const app = boot({
+    currentOwner: "1",
+    fetchImpl: async () => ({
+      headers: {
+        get(name) {
+          if (name === "x-rate-limit-remaining") return "50";
+          if (name === "x-rate-limit-reset") return String(resetAt);
+          return null;
+        },
+      },
+      ok: false,
+      status: 500,
+    }),
+    storedBlockEnabled: "false",
+  });
+  const result = await app.hooks.fetchCountry("Alice");
+  assert.equal(result.retryable, true);
+  assert.equal(result.retryAfterMs, 0, "a generic server error must not wait for the quota window");
+  assert.ok(result.rateLimitResetAfterMs > 14 * 60 * 1000);
+};
+
+const makeQueuedTweet = () => ({
+  closest() { return null; },
+  isConnected: true,
+  querySelector() { return null; },
+});
+
+const queueVerifiedBlock = (app, user) => {
+  app.hooks.seedCachedUser(user);
+  app.hooks.rememberLookupRecord(user.screenName, {
+    tweetText: `Post by ${user.screenName}`,
+    tweetUrl: `https://x.com/${user.screenName}/status/1`,
+  });
+  return app.hooks.enqueueBlock(user.screenName, user.country, makeQueuedTweet(), {
+    tweetText: `Post by ${user.screenName}`,
+    tweetUrl: `https://x.com/${user.screenName}/status/1`,
+    verifiedUser: user,
+  });
+};
+
+const testImmediateNormalBlocks = async () => {
+  const requestTimes = [];
+  const fetchImpl = async (url, options) => {
+    if (!url.includes("blocks/create.json")) throw new Error(`Unexpected request: ${url}`);
+    requestTimes.push(Date.now());
+    const restId = new URLSearchParams(options.body).get("user_id");
+    return { json: () => Promise.resolve({ id_str: restId }), ok: true, status: 200 };
+  };
+  const app = boot({ currentOwner: "1", fetchImpl, storedOwner: "1" });
+  queueVerifiedBlock(app, {
+    restId: "2",
+    screenName: "Bob",
+    name: "Bob",
+    country: "Italy",
+    updatedAt: Date.now(),
+  });
+  queueVerifiedBlock(app, {
+    restId: "3",
+    screenName: "Alice",
+    name: "Alice",
+    country: "Italy",
+    updatedAt: Date.now(),
+  });
+  await waitFor(() => requestTimes.length === 2);
+  assert.ok(
+    requestTimes[1] - requestTimes[0] < 250,
+    "normal block requests must proceed without a fixed cooldown",
+  );
+};
+
+const testQueuedBlockCancellation = async () => {
+  const blockedRestIds = [];
+  let finishFirstBlock;
+  const fetchImpl = (url, options) => {
+    if (!url.includes("blocks/create.json")) throw new Error(`Unexpected request: ${url}`);
+    const restId = new URLSearchParams(options.body).get("user_id");
+    blockedRestIds.push(restId);
+    if (restId === "2") {
+      return new Promise((resolve) => {
+        finishFirstBlock = () => resolve({
+          json: () => Promise.resolve({ id_str: restId }),
+          ok: true,
+          status: 200,
+        });
+      });
+    }
+    return Promise.resolve({ json: () => Promise.resolve({ id_str: restId }), ok: true, status: 200 });
+  };
+  const app = boot({ currentOwner: "1", fetchImpl, storedOwner: "1" });
+  queueVerifiedBlock(app, {
+    restId: "2",
+    screenName: "Bob",
+    name: "Bob",
+    country: "Italy",
+    updatedAt: Date.now(),
+  });
+  await waitFor(() => blockedRestIds.length === 1);
+  queueVerifiedBlock(app, {
+    restId: "3",
+    screenName: "Alice",
+    name: "Alice",
+    country: "Italy",
+    updatedAt: Date.now(),
+  });
+  assert.equal(JSON.stringify(app.hooks.getBlockQueue()), JSON.stringify([{ restId: "3", username: "Alice" }]));
+  await app.hooks.removeLookupRecord("Alice");
+  assert.equal(app.hooks.getBlockQueue().length, 0, "removing a lookup must cancel its pending block");
+  finishFirstBlock();
+  await waitFor(() => app.hooks.getLookupRecord("Bob") == null);
+  assert.deepEqual(blockedRestIds, ["2"], "a removed queued account must never be blocked");
+};
+
+const makeLockManager = () => {
+  const tails = new Map();
+  return {
+    request(name, callback) {
+      const previous = tails.get(name) || Promise.resolve();
+      const result = previous.catch(() => {}).then(callback);
+      tails.set(name, result.catch(() => {}));
+      return result;
+    },
+  };
+};
+
+const testFirefoxForeignLockPromise = async () => {
+  let callbackCount = 0;
+  const locks = {
+    request(name, callback) {
+      assert.equal(name, "localefence:location-request");
+      void Promise.resolve().then(callback);
+      return Object.defineProperty({}, "then", {
+        get() {
+          throw new Error('Permission denied to access property "then"');
+        },
+      });
+    },
+  };
+  const app = boot({
+    currentOwner: "1",
+    navigatorImpl: { locks },
+    storedBlockEnabled: "false",
+  });
+  const result = await app.hooks.withLookupRequestLock(async () => {
+    callbackCount += 1;
+    return "completed";
+  });
+  assert.equal(result, "completed");
+  assert.equal(callbackCount, 1);
+};
+
+const testConcurrentTabDeduplication = async () => {
+  const sharedStorage = new Map([
+    ["localefence.blockEnabled", "true"],
+    ["localefence.blockOwnerRestId", "1"],
+    ["localefence.locations", "Italy"],
+    ["localefence.notificationsEnabled", "false"],
+  ]);
+  const locks = makeLockManager();
+  const blockedRestIds = [];
+  const fetchImpl = async (url, options) => {
+    if (!url.includes("blocks/create.json")) throw new Error(`Unexpected request: ${url}`);
+    const restId = new URLSearchParams(options.body).get("user_id");
+    blockedRestIds.push(restId);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    return { json: () => Promise.resolve({ id_str: restId }), ok: true, status: 200 };
+  };
+  const firstTab = boot({
+    currentOwner: "1",
+    fetchImpl,
+    navigatorImpl: { locks },
+    storageValues: sharedStorage,
+    storedOwner: "1",
+  });
+  const secondTab = boot({
+    currentOwner: "1",
+    fetchImpl,
+    navigatorImpl: { locks },
+    storageValues: sharedStorage,
+    storedOwner: "1",
+  });
+  const user = {
+    restId: "2",
+    screenName: "Alice",
+    name: "Alice",
+    country: "Italy",
+    updatedAt: Date.now(),
+  };
+  queueVerifiedBlock(firstTab, user);
+  queueVerifiedBlock(secondTab, user);
+  await waitFor(() =>
+    firstTab.hooks.getLookupRecord("Alice") == null && secondTab.hooks.getLookupRecord("Alice") == null,
+  );
+  assert.deepEqual(blockedRestIds, ["2"], "two X tabs must serialize and deduplicate the same block");
+};
+
+const testPausedStateAndOwnedVisibility = async () => {
+  const sharedStorage = new Map([
+    ["localefence.blockEnabled", "true"],
+    ["localefence.blockOwnerRestId", "1"],
+    ["localefence.locations", "Italy"],
+    ["localefence.notificationsEnabled", "false"],
+  ]);
+  const firstLoad = boot({ currentOwner: "1", storageValues: sharedStorage, storedOwner: "1" });
+  firstLoad.hooks.pauseBlocking("Paused for a test");
+  assert.equal(firstLoad.stored("localefence.blockPaused"), "true");
+  const reloaded = boot({ currentOwner: "1", storageValues: sharedStorage, storedOwner: "1" });
+  assert.equal(reloaded.hooks.getBlockPaused(), true, "a safety pause must survive reloads");
+
+  const feedCell = { dataset: {}, style: {} };
+  const tweet = { closest: () => feedCell };
+  reloaded.hooks.applyPostVisibility(tweet, "Italy");
+  assert.equal(feedCell.dataset.localefenceHidden, "true");
+  assert.equal(feedCell.style.display, undefined, "LocaleFence must not overwrite X's inline display style");
+  reloaded.hooks.applyPostVisibility(tweet, "France");
+  assert.equal(feedCell.dataset.localefenceHidden, undefined);
+};
+
+const testCompleteReset = async () => {
+  const values = new Map([
+    ["localefence.blockEnabled", "true"],
+    ["localefence.blockOwnerRestId", "1"],
+    ["localefence.locations", "Italy"],
+    ["localefence.futureSetting", "remove me too"],
+    ["unrelated.setting", "keep me"],
+  ]);
+  const app = boot({ currentOwner: "1", storageValues: values, storedOwner: "1" });
+  await app.hooks.resetLocaleFenceData();
+  assert.equal(app.blockEnabled(), false);
+  assert.equal(app.hooks.getSelectedLocations().length, 0);
+  assert.equal([...values.keys()].some((key) => key.startsWith("localefence.")), false);
+  assert.equal(values.get("unrelated.setting"), "keep me");
+};
+
+const run = async () => {
+  testAndroidMountRecovery();
+  await testQueryIdRecovery();
+  await testPostTransportFallback();
+  await testTerminalLookupFailuresDoNotRetry();
+  await testRateLimitBackoffPersistence();
+  await testNonRateLimitErrorIgnoresQuotaReset();
+  await testImmediateNormalLookups();
+  await testFreshIdentityAndDurableDeduplication();
+  await testImmediateNormalBlocks();
+  await testQueuedBlockCancellation();
+  await testFirefoxForeignLockPromise();
+  await testConcurrentTabDeduplication();
+  await testPausedStateAndOwnedVisibility();
+  await testCompleteReset();
+};
+
+run()
+  .then(() => console.log("LocaleFence safety and lifecycle checks passed"))
   .catch((error) => {
     console.error(error);
     process.exitCode = 1;

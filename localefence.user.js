@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         LocaleFence for X
 // @namespace    https://github.com/ssupt/LocaleFence
-// @version      1.1.0
-// @description  Hide posts and block accounts based on their X account location
+// @version      1.2.3
+// @description  See X account countries, hide matching posts, and optionally block matching accounts
 // @author       ssupt
 // @license      GPL-3.0-only
-// @homepageURL  https://github.com/ssupt/LocaleFence
+// @homepageURL  https://greasyfork.org/en/scripts/585483-localefence-for-x
+// @source       https://github.com/ssupt/LocaleFence
 // @supportURL   https://github.com/ssupt/LocaleFence/issues
 // @updateURL    https://raw.githubusercontent.com/ssupt/LocaleFence/main/localefence.user.js
 // @downloadURL  https://raw.githubusercontent.com/ssupt/LocaleFence/main/localefence.user.js
@@ -19,10 +20,46 @@
 // Copyright (C) 2026 ssupt
 
 (() => {
+  // A DOM marker prevents the userscript and browser-extension builds from both
+  // running when someone has installed both distributions. A synchronous
+  // ping distinguishes a live runtime from a stale marker restored by a
+  // discarded mobile tab.
+  const runtimeVersion = "1.2.3";
+  const runtimePingEvent = "localefence:runtime-ping";
+  const runtimeRoot = document.documentElement;
+  const pingExistingRuntime = () => {
+    if (!runtimeRoot?.dataset?.localefenceRuntime || !document.dispatchEvent) return false;
+    const token = `${Date.now()}:${Math.random()}`;
+    runtimeRoot.dataset.localefenceRuntimePing = token;
+    try {
+      document.dispatchEvent(new Event(runtimePingEvent));
+    } catch { /* A stale marker is handled below. */ }
+    const acknowledged = runtimeRoot.dataset.localefenceRuntimePong === token;
+    delete runtimeRoot.dataset.localefenceRuntimePing;
+    delete runtimeRoot.dataset.localefenceRuntimePong;
+    return acknowledged;
+  };
+  if (runtimeRoot?.dataset?.localefenceRuntime) {
+    if (pingExistingRuntime()) return;
+    const claimedAt = Number(runtimeRoot.dataset.localefenceRuntimeClaimedAt);
+    if (Number.isFinite(claimedAt) && Date.now() - claimedAt < 2000) return;
+    document.querySelectorAll?.(
+      "[data-localefence-root], [data-localefence-toasts], [data-localefence-styles]",
+    ).forEach((node) => node.remove());
+  }
+  if (runtimeRoot?.dataset) {
+    runtimeRoot.dataset.localefenceRuntime = runtimeVersion;
+    runtimeRoot.dataset.localefenceRuntimeClaimedAt = String(Date.now());
+  }
+  document.addEventListener?.(runtimePingEvent, () => {
+    const token = runtimeRoot?.dataset?.localefenceRuntimePing;
+    if (token) runtimeRoot.dataset.localefenceRuntimePong = token;
+  });
+
   // X uses this public bearer token in its own web client. It is not a personal credential.
   const authToken =
     "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
-  const queryUrl = "https://x.com/i/api/graphql/XRqGa7EeokUU5kppkh13EA/AboutAccountQuery";
+  const fallbackAboutQueryId = "zs_jFPFT78rBpXv9Z3U2YQ";
   const blockUrl = "https://x.com/i/api/1.1/blocks/create.json";
   const unblockUrl = "https://x.com/i/api/1.1/blocks/destroy.json";
   const getCookie = (name) => document.cookie.match(new RegExp(`(?:^|; )${name}=([^;]*)`))?.[1] || "";
@@ -52,6 +89,90 @@
       localStorage.setItem(key, String(value));
     } catch { /* Storage can be unavailable in restricted browser contexts. */ }
   };
+  const removeStorage = (key) => {
+    try {
+      localStorage.removeItem(key);
+    } catch { /* Storage can be unavailable in restricted browser contexts. */ }
+  };
+  const removeStorageByPrefix = (prefix) => {
+    const keys = [];
+    try {
+      for (let index = 0; index < localStorage.length; index += 1) {
+        const key = localStorage.key(index);
+        if (key?.startsWith(prefix)) keys.push(key);
+      }
+    } catch { /* Storage can be unavailable in restricted browser contexts. */ }
+    keys.forEach(removeStorage);
+  };
+  // Firefox content scripts can expose Web Locks promises through a page
+  // compartment. Awaiting that foreign promise throws a permission error, so
+  // resolve a promise owned by LocaleFence from inside the lock callback.
+  const withExclusiveWebLock = (name, callback) => {
+    const locks = globalThis.navigator?.locks;
+    if (!locks?.request) return callback();
+    return new Promise((resolve, reject) => {
+      try {
+        void locks.request(name, async () => {
+          try {
+            resolve(await callback());
+          } catch (error) {
+            reject(error);
+          }
+        });
+      } catch (error) {
+        reject(error);
+      }
+    });
+  };
+  const aboutQueryIdStorageKey = "localefence.aboutQueryId";
+  const rejectedAboutQueryIds = new Set();
+  const isAboutQueryId = (value) => /^[A-Za-z0-9_-]{10,64}$/.test(value || "");
+  const extractAboutQueryId = (value) => {
+    const match = String(value || "").match(/\/graphql\/([^/?]+)\/AboutAccountQuery(?:[/?]|$)/);
+    return isAboutQueryId(match?.[1]) ? match[1] : "";
+  };
+  const storedAboutQueryId = readStorage(aboutQueryIdStorageKey);
+  let aboutQueryId = isAboutQueryId(storedAboutQueryId) ? storedAboutQueryId : fallbackAboutQueryId;
+  const rememberAboutQueryId = (value) => {
+    const candidate = isAboutQueryId(value) ? value : extractAboutQueryId(value);
+    if (!candidate || rejectedAboutQueryIds.has(candidate)) return false;
+    aboutQueryId = candidate;
+    writeStorage(aboutQueryIdStorageKey, candidate);
+    return true;
+  };
+  const discoverObservedAboutQueryId = () => {
+    let entries = [];
+    try {
+      entries = globalThis.performance?.getEntriesByType?.("resource") || [];
+    } catch { /* Resource timing may be unavailable in restricted contexts. */ }
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const candidate = extractAboutQueryId(entries[index]?.name);
+      if (candidate && !rejectedAboutQueryIds.has(candidate)) return rememberAboutQueryId(candidate);
+    }
+    return false;
+  };
+  discoverObservedAboutQueryId();
+  try {
+    if (globalThis.PerformanceObserver) {
+      const observer = new globalThis.PerformanceObserver((list) => {
+        list.getEntries().forEach((entry) => rememberAboutQueryId(entry?.name));
+      });
+      try {
+        observer.observe({ type: "resource", buffered: true });
+      } catch {
+        observer.observe({ entryTypes: ["resource"] });
+      }
+    }
+  } catch { /* Query-ID observation is a best-effort resilience feature. */ }
+  const recoverAboutQueryId = (rejectedQueryId) => {
+    rejectedAboutQueryIds.add(rejectedQueryId);
+    if (aboutQueryId !== rejectedQueryId && !rejectedAboutQueryIds.has(aboutQueryId)) return true;
+    if (discoverObservedAboutQueryId()) return true;
+    if (!rejectedAboutQueryIds.has(fallbackAboutQueryId)) return rememberAboutQueryId(fallbackAboutQueryId);
+    return false;
+  };
+  const getAboutQueryUrl = () =>
+    `https://x.com/i/api/graphql/${aboutQueryId}/AboutAccountQuery`;
 
   // Runtime state
   const screenNames = new Map();
@@ -70,16 +191,21 @@
   let processing = false;
   let blockProcessing = false;
   const blockEnabledStorageKey = "localefence.blockEnabled";
+  const blockPausedStorageKey = "localefence.blockPaused";
   const blockOwnerStorageKey = "localefence.blockOwnerRestId";
   const blockedAccountStorageKey = "localefence.blockedAccounts";
   const maxBlockedAccountEntries = 10000;
+  const isRestId = (value) => /^\d+$/.test(value || "");
   const blockAccountKey = (ownerRestId, restId) =>
-    ownerRestId && restId ? `${ownerRestId}:${restId}` : "";
-  const blockedAccountKeys = new Set(
-    (readStorage(blockedAccountStorageKey) || "")
-      .split("\n")
-      .filter((key) => /^\d+:\d+$/.test(key)),
-  );
+    isRestId(ownerRestId) && isRestId(restId) ? `${ownerRestId}:${restId}` : "";
+  const parseBlockedAccountKeys = (value) =>
+    (value || "").split("\n").filter((key) => /^\d+:\d+$/.test(key));
+  const blockedAccountKeys = new Set(parseBlockedAccountKeys(readStorage(blockedAccountStorageKey)));
+  const refreshBlockedAccountKeys = () => {
+    blockedAccountKeys.clear();
+    parseBlockedAccountKeys(readStorage(blockedAccountStorageKey)).forEach((key) => blockedAccountKeys.add(key));
+    trimBlockedAccountKeys();
+  };
   const saveBlockedAccountKeys = () =>
     writeStorage(blockedAccountStorageKey, [...blockedAccountKeys].join("\n"));
   const trimBlockedAccountKeys = () => {
@@ -111,8 +237,9 @@
   if (invalidStoredBlockOwner) {
     blockEnabled = false;
     writeStorage(blockEnabledStorageKey, false);
+    writeStorage(blockPausedStorageKey, false);
   }
-  let blockPaused = false;
+  let blockPaused = blockEnabled && readStorage(blockPausedStorageKey) === "true";
   let blockSuccessCount = 0;
   const storedTotalBlocked = readStorage("localefence.totalBlocked");
   const parsedTotalBlocked = Number(storedTotalBlocked);
@@ -121,13 +248,13 @@
     : 0;
   let blockErrorMessage = invalidStoredBlockOwner
     ? "Automatic blocking was turned off. Enable it again for this X account."
-    : "";
+    : blockPaused
+      ? "Paused after a block request error. Turn blocking off and on to retry."
+      : "";
   let lookupStatusMessage = "";
   let lookupStatusError = false;
   let queueTimer = null;
   let hydrationReady = Promise.resolve();
-  let lastRequestTime = 0;
-  let lastBlockRequestTime = 0;
   const countryAliases = {
     "Cabo Verde": "Cape Verde",
     Eswatini: "Swaziland",
@@ -138,8 +265,41 @@
   };
   const dayMs = 24 * 60 * 60 * 1000;
   const cacheTtlMs = 28 * dayMs;
-  const countryRequestDelayMs = 750;
-  const blockRequestDelayMs = 2000;
+  const defaultRateLimitDelayMs = 15 * 1000;
+  const maximumRateLimitDelayMs = dayMs;
+  const lookupBackoffStorageKey = "localefence.lookupBackoffUntil";
+  const clamp = (value, minimum, maximum) => Math.min(Math.max(value, minimum), maximum);
+  const readFutureTimestamp = (key) => {
+    const timestamp = Number(readStorage(key));
+    const now = Date.now();
+    return Number.isFinite(timestamp) && timestamp > now && timestamp <= now + maximumRateLimitDelayMs
+      ? timestamp
+      : 0;
+  };
+  let lookupBackoffUntil = readFutureTimestamp(lookupBackoffStorageKey);
+  // Versions 1.2.0-1.2.1 persisted adaptive pacing. Normal requests are now
+  // immediate again; only an explicit quota exhaustion or retry cooldown waits.
+  removeStorage("localefence.lookupRequestDelayMs");
+  removeStorage("localefence.lastLookupRequestAt");
+  removeStorageByPrefix("localefence.lastBlockRequestAt.");
+  const setLookupBackoffUntil = (timestamp) => {
+    const now = Date.now();
+    lookupBackoffUntil = Number.isFinite(timestamp) && timestamp > now
+      ? Math.min(timestamp, now + maximumRateLimitDelayMs)
+      : 0;
+    if (lookupBackoffUntil) writeStorage(lookupBackoffStorageKey, lookupBackoffUntil);
+    else removeStorage(lookupBackoffStorageKey);
+  };
+  const syncLookupBackoffUntil = () => {
+    lookupBackoffUntil = readFutureTimestamp(lookupBackoffStorageKey);
+    return lookupBackoffUntil;
+  };
+  const describeLookupBackoff = () =>
+    `X paused location lookups until ${new Date(lookupBackoffUntil).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    })} to respect its rate limit. Accounts remain queued locally and will resume while X is open.`;
+  if (lookupBackoffUntil) lookupStatusMessage = describeLookupBackoff();
   const maxLookupRetries = 6;
   const maxLookupQueueEntries = 500;
   const maxCachedAccounts = 5000;
@@ -525,6 +685,11 @@
       return "";
     }
   };
+  const safeDate = (value) => {
+    const timestamp = Number(value);
+    const date = new Date(Number.isFinite(timestamp) ? timestamp : 0);
+    return Number.isNaN(date.getTime()) ? new Date(0) : date;
+  };
   const showToast = (
     message,
     { actionLabel = "", country = "", error = false, onAction = null, postText = "", targetUrl = "" } = {},
@@ -616,7 +781,8 @@
   };
   const compact = (object) =>
     Object.fromEntries(Object.entries(object).filter(([, value]) => value !== undefined && value !== ""));
-  const usernameKey = (username) => username?.toLowerCase?.();
+  const usernameKey = (username) =>
+    typeof username === "string" && /^[A-Za-z0-9_]{1,15}$/.test(username) ? username.toLowerCase() : "";
   // Persistent cache, lookup queue, and block history
   const dbPromise = new Promise((resolve) => {
     let request;
@@ -658,7 +824,6 @@
     request.onblocked = () => finish(null);
   });
 
-  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const fetchWithTimeout = async (url, options, timeoutMs) => {
     const Controller = globalThis.AbortController;
     if (!Controller) return globalThis.fetch(url, options);
@@ -725,7 +890,7 @@
     }
   };
   const processAboutUser = (user) => {
-    if (!user?.rest_id || !user.core?.screen_name) return null;
+    if (!isRestId(user?.rest_id) || !usernameKey(user?.core?.screen_name)) return null;
     return compact({
       restId: user.rest_id,
       screenName: user.core.screen_name,
@@ -736,7 +901,7 @@
   };
   const normalizeStoredUser = (restId, user) =>
     compact({
-      restId: user?.restId || restId,
+      restId: isRestId(user?.restId) ? user.restId : isRestId(restId) ? restId : "",
       screenName: user?.screenName,
       name: user?.name,
       country: resolveCountryAlias(user?.country),
@@ -904,8 +1069,14 @@
     for (let index = queue.length - 1; index >= 0; index -= 1) {
       if (usernameKey(queue[index]) === key) queue.splice(index, 1);
     }
+    for (let index = blockQueue.length - 1; index >= 0; index -= 1) {
+      if (usernameKey(blockQueue[index].username) !== key) continue;
+      queuedBlockIds.delete(blockQueue[index].restId);
+      blockQueue.splice(index, 1);
+    }
     lookupRecords.delete(key);
     renderLookupQueue();
+    renderActionControls();
     try {
       const db = await dbPromise;
       if (!db) return;
@@ -946,6 +1117,8 @@
     return record;
   };
   const clearLookupRecords = async () => {
+    clearBlockQueue();
+    setLookupBackoffUntil(0);
     lookupRecords.forEach((record) => {
       const timer = lookupRetryTimers.get(record.key);
       if (timer) clearTimeout(timer);
@@ -1000,11 +1173,41 @@
     blockEnabled = false;
     blockPaused = false;
     blockErrorMessage = message;
-    if (persist) writeStorage(blockEnabledStorageKey, false);
+    if (persist) {
+      writeStorage(blockEnabledStorageKey, false);
+      writeStorage(blockPausedStorageKey, false);
+    }
     clearBlockQueue();
     lookupRecords.forEach((record) => {
       if (record.status === "awaiting_block") removeLookupRecord(record.username);
     });
+    renderActionControls();
+  };
+  const resetLocaleFenceData = async () => {
+    disableBlocking();
+    await Promise.all([clearLookupRecords(), clearBlockHistory(), clearCacheStores()]);
+    aboutUsers.clear();
+    screenNames.clear();
+    selectedLocations.clear();
+    excludedUserIds.clear();
+    blockedAccountKeys.clear();
+    blockOwnerRestId = "";
+    hideEnabled = true;
+    notificationsEnabled = true;
+    countrySort = "default";
+    blockSuccessCount = 0;
+    totalBlockedCount = 0;
+    blockErrorMessage = "";
+    setLookupStatus();
+    removeStorageByPrefix("localefence.");
+    document.querySelectorAll("[data-account-based-in]").forEach((node) => node.remove());
+    document.querySelectorAll("[data-localefence-hidden]").forEach((node) => {
+      delete node.dataset.localefenceHidden;
+    });
+    document.querySelector("[data-localefence-toasts]")?.remove();
+    renderLocationStats();
+    renderLookupQueue();
+    renderBlockHistory();
     renderActionControls();
   };
   const ensureBlockOwner = () => {
@@ -1018,6 +1221,7 @@
   globalThis.addEventListener("storage", (event) => {
     if (event.key === null) {
       blockOwnerRestId = "";
+      lookupBackoffUntil = 0;
       selectedLocations.clear();
       excludedUserIds.clear();
       blockedAccountKeys.clear();
@@ -1025,6 +1229,8 @@
       notificationsEnabled = true;
       totalBlockedCount = 0;
       if (blockEnabled) disableBlocking();
+      blockPaused = false;
+      setLookupStatus();
       refreshProcessedAccounts();
       renderLocationStats();
       renderActionControls();
@@ -1038,19 +1244,42 @@
       }
     } else if (event.key === blockEnabledStorageKey) {
       if (event.newValue !== "true") {
-        if (blockEnabled) disableBlocking();
+        if (blockEnabled) disableBlocking("", false);
       } else {
         blockOwnerRestId = readStorage(blockOwnerStorageKey) || blockOwnerRestId;
         if (blockOwnerRestId === getOwnRestId() && selectedLocations.size) {
           blockEnabled = true;
           blockPaused = false;
           blockErrorMessage = "";
+          writeStorage(blockPausedStorageKey, false);
           refreshProcessedAccounts();
           resumeAwaitingBlocks();
           renderActionControls();
         } else {
           disableBlocking("Automatic blocking was not enabled because the active X account or filters differ.");
         }
+      }
+    } else if (event.key === blockPausedStorageKey) {
+      blockPaused = blockEnabled && event.newValue === "true";
+      if (blockPaused) {
+        blockErrorMessage = "Paused after a block request error. Turn blocking off and on to retry.";
+        clearBlockQueue();
+      } else if (blockEnabled) {
+        blockErrorMessage = "";
+        refreshProcessedAccounts();
+        resumeAwaitingBlocks();
+      }
+      renderActionControls();
+    } else if (event.key === lookupBackoffStorageKey) {
+      syncLookupBackoffUntil();
+      if (lookupBackoffUntil) {
+        setLookupStatus(describeLookupBackoff());
+        if (document.visibilityState !== "hidden") {
+          scheduleQueue(Math.max(lookupBackoffUntil - Date.now(), 1000));
+        }
+      } else {
+        setLookupStatus();
+        if (document.visibilityState !== "hidden") scheduleQueue();
       }
     } else if (event.key === "localefence.locations") {
       selectedLocations.clear();
@@ -1074,11 +1303,7 @@
       refreshProcessedAccounts();
       renderActionControls();
     } else if (event.key === blockedAccountStorageKey) {
-      blockedAccountKeys.clear();
-      (event.newValue || "").split("\n").filter((key) => /^\d+:\d+$/.test(key)).forEach((key) => {
-        blockedAccountKeys.add(key);
-      });
-      trimBlockedAccountKeys();
+      refreshBlockedAccountKeys();
     } else if (event.key === "localefence.totalBlocked") {
       const nextTotal = Number(event.newValue);
       totalBlockedCount = Number.isFinite(nextTotal) && nextTotal >= 0 ? nextTotal : 0;
@@ -1088,6 +1313,7 @@
   const pauseBlocking = (message) => {
     blockPaused = true;
     blockErrorMessage = message;
+    writeStorage(blockPausedStorageKey, true);
     clearBlockQueue();
     renderActionControls();
     showToast(message, { error: true });
@@ -1107,6 +1333,7 @@
     });
   };
   const sendBlockRequest = async (restId, url) => {
+    if (!isRestId(restId)) throw new Error("The X account ID is invalid");
     const csrfToken = getCsrfToken();
     if (!csrfToken) throw new Error("X session CSRF token is unavailable");
     let response;
@@ -1130,12 +1357,13 @@
       }
       throw error;
     }
-    if (response.ok) return;
+    let responseJson = null;
     let details = "";
     try {
-      const json = await response.json();
-      details = json?.errors?.map((error) => error.message).filter(Boolean).join("; ") || "";
+      responseJson = await response.json();
+      details = responseJson?.errors?.map((error) => error.message).filter(Boolean).join("; ") || "";
     } catch { /* An error body is optional. */ }
+    if (response.ok && !details) return responseJson;
     throw new Error(`X returned ${response.status}${details ? `: ${details}` : ""}`);
   };
   const blockAccount = (restId) => sendBlockRequest(restId, blockUrl);
@@ -1143,6 +1371,9 @@
   const getAccountLabel = (restId, username) => {
     const name = aboutUsers.get(restId)?.name?.trim();
     return name ? `${name} (@${username})` : `@${username}`;
+  };
+  const withBlockRequestLock = (ownerRestId, callback) => {
+    return withExclusiveWebLock(`localefence:block-request:${ownerRestId}`, callback);
   };
   const excludeAndUnblock = async ({ country, historyId, ownerRestId, restId, username }) => {
     if (!ownerRestId || ownerRestId !== getOwnRestId()) {
@@ -1167,7 +1398,6 @@
       return true;
     }
     forgetBlockedAccount(ownerRestId, restId);
-    blockSuccessCount = Math.max(0, blockSuccessCount - 1);
     markFeedAccount(username, "Excluded");
     try {
       await updateBlockHistoryStatus(historyId, "excluded");
@@ -1183,8 +1413,10 @@
       while (blockEnabled && blockQueue.length) {
         const { country, restId, tweetText, tweetUrl, username } = blockQueue.shift();
         queuedBlockIds.delete(restId);
+        const key = usernameKey(username);
         const cached = getCachedAccount(username);
         if (
+          !lookupRecords.has(key) ||
           !cached ||
           !isCountryBlocked(cached.country) ||
           screenNames.get(usernameKey(username)) !== restId ||
@@ -1193,29 +1425,49 @@
         ) {
           continue;
         }
-        const waitTime = blockRequestDelayMs - (Date.now() - lastBlockRequestTime);
-        if (waitTime > 0) await wait(waitTime);
         if (!ensureBlockOwner()) break;
-        const latestCached = getCachedAccount(username);
-        if (
-          !latestCached ||
-          !isCountryBlocked(latestCached.country) ||
-          screenNames.get(usernameKey(username)) !== restId ||
-          excludedUserIds.has(restId)
-        ) continue;
-        if (isKnownBlocked(blockOwnerRestId, restId)) continue;
         const requestOwnerRestId = blockOwnerRestId;
+        let outcome = "cancelled";
         try {
-          await blockAccount(restId);
+          outcome = await withBlockRequestLock(requestOwnerRestId, async () => {
+            refreshBlockedAccountKeys();
+            if (isKnownBlocked(requestOwnerRestId, restId)) return "known";
+            if (!lookupRecords.has(key) || !ensureBlockOwner() || blockOwnerRestId !== requestOwnerRestId) {
+              return "cancelled";
+            }
+            let latestCached = getCachedAccount(username);
+            if (
+              !latestCached ||
+              !isCountryBlocked(latestCached.country) ||
+              screenNames.get(key) !== restId ||
+              excludedUserIds.has(restId)
+            ) return "cancelled";
+            latestCached = getCachedAccount(username);
+            if (
+              !lookupRecords.has(key) ||
+              !ensureBlockOwner() ||
+              blockOwnerRestId !== requestOwnerRestId ||
+              !latestCached ||
+              !isCountryBlocked(latestCached.country) ||
+              screenNames.get(key) !== restId ||
+              excludedUserIds.has(restId)
+            ) return "cancelled";
+            await blockAccount(restId);
+            rememberBlockedAccount(requestOwnerRestId, restId);
+            return "blocked";
+          });
         } catch (error) {
-          lastBlockRequestTime = Date.now();
           pauseBlocking(
             `Paused after an error: ${error?.message || "block request failed"}. Turn blocking off and on to retry.`,
           );
           continue;
         }
-        lastBlockRequestTime = Date.now();
-        rememberBlockedAccount(requestOwnerRestId, restId);
+        if (outcome === "known") {
+          markFeedAccount(username, "Blocked");
+          await removeLookupRecord(username);
+          continue;
+        }
+        if (outcome !== "blocked") continue;
         blockSuccessCount += 1;
         totalBlockedCount += 1;
         writeStorage("localefence.totalBlocked", totalBlockedCount);
@@ -1431,7 +1683,13 @@
     const retainedLookupRecords = storedLookupRecords
       .filter((record) => record?.key && record?.username)
       .sort((a, b) => Number(a.enqueuedAt) - Number(b.enqueuedAt))
-      .slice(-maxLookupQueueEntries);
+      .slice(-maxLookupQueueEntries)
+      // A browser shutdown or reload can interrupt a request after it was
+      // marked as checking. No request survives that page, so make it eligible
+      // for processing again instead of showing a permanently stuck item.
+      .map((record) => record.status === "checking"
+        ? { ...record, status: "lookup", lastError: "" }
+        : record);
     retainedLookupRecords.forEach((record) => {
       if (!lookupRecords.has(record.key)) lookupRecords.set(record.key, record);
     });
@@ -1461,11 +1719,51 @@
     lookupRetryTimers.delete(key);
     lookupAttempts.delete(key);
   };
+  const parseRetryAfterMs = (headers) => {
+    const value = headers?.get?.("retry-after");
+    if (!value) return 0;
+    const seconds = Number(value);
+    if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
+    const timestamp = Date.parse(value);
+    return Number.isFinite(timestamp) && timestamp > Date.now() ? timestamp - Date.now() : 0;
+  };
+  const readRateLimit = (headers) => {
+    const now = Date.now();
+    const remainingValue = headers?.get?.("x-rate-limit-remaining");
+    const resetValue = headers?.get?.("x-rate-limit-reset");
+    const remaining = remainingValue == null ? NaN : Number(remainingValue);
+    const resetSeconds = resetValue == null ? NaN : Number(resetValue);
+    const resetAt = Number.isFinite(resetSeconds) && resetSeconds > 0 ? resetSeconds * 1000 : 0;
+    const resetDelayMs = resetAt > now ? resetAt - now + 1000 : 0;
+    return {
+      rateLimitRemaining: Number.isFinite(remaining) ? remaining : null,
+      rateLimitResetAfterMs: resetDelayMs,
+      retryAfterMs: parseRetryAfterMs(headers),
+    };
+  };
   const scheduleLookupRetry = (username, result) => {
     const key = usernameKey(username);
     if (!lookupRecords.has(key)) {
       pending.delete(key);
-      return;
+      return false;
+    }
+    const rateLimited = result.status === 429;
+    if (rateLimited) {
+      clearLookupRetry(username);
+      const delay = clamp(
+        result.retryAfterMs || defaultRateLimitDelayMs,
+        1000,
+        maximumRateLimitDelayMs,
+      );
+      setLookupBackoffUntil(Date.now() + delay);
+      if (!queue.some((queuedUsername) => usernameKey(queuedUsername) === key)) queue.push(username);
+      updateLookupRecord(username, {
+        attempts: 0,
+        status: "rate_limited",
+        lastError: "HTTP 429",
+      });
+      setLookupStatus(describeLookupBackoff());
+      return true;
     }
     const attempt = (lookupAttempts.get(key) || 0) + 1;
     if (attempt > maxLookupRetries) {
@@ -1477,15 +1775,14 @@
         lastError: result.status ? `HTTP ${result.status}` : result.reason || "Temporary lookup failure",
       });
       setLookupStatus(`Some locations could not be loaded after ${maxLookupRetries} retries. Use Retry in Lookup queue.`, true);
-      return;
+      return false;
     }
     lookupAttempts.set(key, attempt);
-    const rateLimited = result.status === 429;
-    const baseDelay = result.retryAfterMs || (rateLimited ? 15000 : 2000);
-    const maximumDelay = rateLimited ? 300000 : 60000;
+    const baseDelay = result.retryAfterMs || 2000;
+    const maximumDelay = 60000;
     const delay = Math.min(baseDelay * 2 ** (attempt - 1), maximumDelay) + Math.floor(Math.random() * 750);
-    if (rateLimited || result.status === 401 || result.status === 403 || result.reason === "session") {
-      lookupBackoffUntil = Math.max(lookupBackoffUntil, Date.now() + delay);
+    if (result.status === 401 || result.status === 403 || result.reason === "session") {
+      setLookupBackoffUntil(Math.max(lookupBackoffUntil, Date.now() + delay));
     }
     const existingTimer = lookupRetryTimers.get(key);
     if (existingTimer) clearTimeout(existingTimer);
@@ -1494,7 +1791,7 @@
       setTimeout(() => {
         lookupRetryTimers.delete(key);
         if (!pending.has(key)) return;
-        queue.push(username);
+        if (!queue.some((queuedUsername) => usernameKey(queuedUsername) === key)) queue.push(username);
         scheduleQueue();
       }, delay),
     );
@@ -1504,35 +1801,52 @@
       lastError: result.status ? `HTTP ${result.status}` : result.reason || "Temporary lookup failure",
     });
     setLookupStatus(
-      rateLimited
-        ? `X rate-limited location lookups; retrying automatically in about ${Math.ceil(delay / 1000)} seconds.`
-        : `Location lookup failed temporarily; retrying automatically (${attempt}/${maxLookupRetries}).`,
+      `Location lookup failed temporarily; retrying automatically (${attempt}/${maxLookupRetries}).`,
     );
+    return false;
   };
-
-  let lookupBackoffUntil = 0;
-  const fetchCountry = async (username) => {
-    const url = `${queryUrl}?${new URLSearchParams({ variables: JSON.stringify({ screenName: username }) })}`;
+  const fetchCountry = async (username, options = {}) => {
+    const { method = "POST", recoveredQueryId = false } = options;
+    const requestedQueryId = aboutQueryId;
+    const url = `${getAboutQueryUrl()}?${new URLSearchParams({ variables: JSON.stringify({ screenName: username }) })}`;
     const csrfToken = getCsrfToken();
     if (!csrfToken) return { found: false, retryable: true, reason: "session", retryAfterMs: 1500 };
     try {
       // The request uses the signed-in X session and only asks for account location metadata.
       const res = await fetchWithTimeout(url, {
-        method: "POST",
+        method,
         headers: {
           authorization: authToken,
           "x-csrf-token": csrfToken,
         },
         credentials: "include",
       }, countryRequestTimeoutMs);
-      if (!res.ok) {
-        const retryAfterSeconds = Number(res.headers.get("retry-after"));
-        const retryAfterMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0 ? retryAfterSeconds * 1000 : 0;
-        const retryable = res.status === 401 || res.status === 403 || res.status === 429 || res.status >= 500;
-        return { found: false, retryable, retryAfterMs, status: res.status };
+      const rateLimit = readRateLimit(res.headers);
+      if (res.status === 429) {
+        rateLimit.retryAfterMs = Math.max(rateLimit.retryAfterMs, rateLimit.rateLimitResetAfterMs);
       }
-      const aboutUser = await saveAboutResponse(await res.json());
-      return aboutUser ? { country: aboutUser.country, found: true, user: aboutUser } : { found: false };
+      if (!res.ok) {
+        if (res.status === 405 && method === "POST") {
+          return fetchCountry(username, { method: "GET", recoveredQueryId });
+        }
+        if (!recoveredQueryId && [400, 404].includes(res.status) && recoverAboutQueryId(requestedQueryId)) {
+          return fetchCountry(username, { method, recoveredQueryId: true });
+        }
+        const retryable = [401, 403, 429].includes(res.status) || res.status >= 500;
+        return { found: false, retryable, status: res.status, ...rateLimit };
+      }
+      const json = await res.json();
+      const aboutUser = await saveAboutResponse(json);
+      if (aboutUser) return { country: aboutUser.country, found: true, user: aboutUser, ...rateLimit };
+      const graphQlErrors = json?.errors?.map((error) => error?.message).filter(Boolean);
+      if (
+        !recoveredQueryId &&
+        graphQlErrors?.some((message) => /operation|persisted|query/i.test(message)) &&
+        recoverAboutQueryId(requestedQueryId)
+      ) return fetchCountry(username, { method, recoveredQueryId: true });
+      return graphQlErrors?.length
+        ? { found: false, retryable: false, reason: graphQlErrors.join("; "), ...rateLimit }
+        : { found: false, ...rateLimit };
     } catch (error) {
       return {
         found: false,
@@ -1545,13 +1859,18 @@
     clearTimeout(queueTimer);
     queueTimer = setTimeout(processQueue, delay);
   };
+  const withLookupRequestLock = (callback) => {
+    return withExclusiveWebLock("localefence:location-request", callback);
+  };
 
   const processQueue = async () => {
     if (processing) return;
     processing = true;
+    let nextQueueDelay = 0;
     try {
       await hydrationReady;
       while (queue.length) {
+        if (document.visibilityState === "hidden") break;
         const username = queue.shift();
         const key = usernameKey(username);
         const targets = pending.get(key);
@@ -1567,16 +1886,30 @@
             continue;
           }
         }
-        const requestDelay = countryRequestDelayMs - (Date.now() - lastRequestTime);
-        const backoffDelay = lookupBackoffUntil - Date.now();
-        const waitTime = Math.max(requestDelay, backoffDelay);
-        if (waitTime > 0) await wait(waitTime);
-        updateLookupRecord(username, { status: "checking" });
-        const result = await fetchCountry(username);
-        lastRequestTime = Date.now();
+        const result = await withLookupRequestLock(async () => {
+          syncLookupBackoffUntil();
+          const backoffDelay = lookupBackoffUntil - Date.now();
+          const waitTime = Math.max(backoffDelay, 0);
+          if (waitTime > 0 || document.visibilityState === "hidden") {
+            return { deferred: true, retryAfterMs: Math.max(waitTime, 0) };
+          }
+          if (!lookupRecords.has(key) || !pending.has(key)) return { cancelled: true };
+          updateLookupRecord(username, { status: "checking" });
+          return fetchCountry(username);
+        });
+        if (result.cancelled) continue;
+        if (result.deferred) {
+          queue.unshift(username);
+          nextQueueDelay = Math.max(result.retryAfterMs, 250);
+          break;
+        }
+        if (result.status !== 429 && result.rateLimitRemaining === 0 && result.rateLimitResetAfterMs > 0) {
+          setLookupBackoffUntil(Date.now() + result.rateLimitResetAfterMs);
+          setLookupStatus(describeLookupBackoff());
+        }
         if (result.found) {
           clearLookupRetry(username);
-          if (!lookupRetryTimers.size) setLookupStatus();
+          if (!lookupRetryTimers.size && !lookupBackoffUntil) setLookupStatus();
           renderLocationStats();
           targets.forEach(({ container, tweet }) => {
             applyCountry(container, tweet, result.country, username);
@@ -1584,7 +1917,10 @@
           resolveLookupRecord(username, result.country, targets, result.user);
           pending.delete(key);
         } else if (result.retryable) {
-          scheduleLookupRetry(username, result);
+          if (scheduleLookupRetry(username, result)) {
+            nextQueueDelay = Math.max(lookupBackoffUntil - Date.now(), 1000);
+            break;
+          }
         } else {
           clearLookupRetry(username);
           if (result.status) {
@@ -1601,7 +1937,7 @@
       }
     } finally {
       processing = false;
-      if (queue.length) scheduleQueue();
+      if (queue.length && document.visibilityState !== "hidden") scheduleQueue(nextQueueDelay);
     }
   };
 
@@ -1609,6 +1945,14 @@
     const key = usernameKey(username);
     if (!key) return;
     const cached = getCachedAccount(username);
+    const existingBadge = container?.querySelector?.("[data-account-based-in]");
+    if (
+      existingBadge &&
+      (!cached || usernameKey(existingBadge.dataset.accountUsername) !== key)
+    ) {
+      existingBadge.remove();
+      applyPostVisibility(tweet, null);
+    }
     if (cached) {
       applyCountry(container, tweet, cached.country, username);
     }
@@ -1641,7 +1985,9 @@
   const getFeedCell = (tweet) => tweet?.closest?.('[data-testid="cellInnerDiv"]') || tweet;
   const applyPostVisibility = (tweet, country) => {
     const target = getFeedCell(tweet);
-    if (target) target.style.display = isCountryHidden(country) ? "none" : "";
+    if (!target?.dataset) return;
+    if (isCountryHidden(country)) target.dataset.localefenceHidden = "true";
+    else delete target.dataset.localefenceHidden;
   };
   const refreshProcessedAccounts = () => {
     document.querySelectorAll("[data-account-based-in]").forEach((node) => {
@@ -1739,6 +2085,23 @@
         z-index: 0;
         font-family: TwitterChirp, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
       }
+      [data-localefence-root][data-localefence-standalone="true"] {
+        position: fixed;
+        right: 20px;
+        bottom: 20px;
+        z-index: 9999;
+        width: auto;
+      }
+      [data-localefence-root][data-localefence-standalone="true"] [data-localefence-trigger] {
+        gap: 0;
+        padding: 12px;
+        border: 1px solid var(--lf-border);
+        background: var(--lf-surface);
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+      }
+      [data-localefence-root][data-localefence-standalone="true"] [data-localefence-label] {
+        display: none;
+      }
       [data-localefence-trigger] {
         display: flex;
         align-items: center;
@@ -1779,6 +2142,9 @@
         display: inline-flex;
         align-items: center;
         gap: 6px;
+      }
+      [data-localefence-hidden="true"] {
+        display: none !important;
       }
       [data-account-state] {
         padding: 1px 6px;
@@ -1985,6 +2351,33 @@
       [data-settings-panel] {
         flex: 1;
         padding: 16px;
+      }
+      [data-reset-panel] {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 8px;
+        margin-top: 16px;
+        padding: 14px;
+        border: 1px solid rgba(244, 33, 46, 0.35);
+        border-radius: 12px;
+      }
+      [data-reset-panel] p {
+        margin: 0;
+        color: var(--lf-muted);
+        font-size: 12px;
+        line-height: 17px;
+      }
+      [data-reset-all] {
+        padding: 6px 14px;
+        border: 1px solid rgba(244, 33, 46, 0.5);
+        border-radius: 9999px;
+        background: transparent;
+        color: #f4212e;
+        font: inherit;
+        font-size: 13px;
+        font-weight: 700;
+        cursor: pointer;
       }
       [data-location-help] {
         color: var(--lf-muted);
@@ -2422,15 +2815,71 @@
       [data-localefence-toast][data-error="true"] [data-toast-icon] {
         background: #f4212e;
       }
+      @media (max-width: 600px) {
+        [data-localefence-root][data-localefence-standalone="true"] {
+          right: 16px;
+          bottom: calc(84px + env(safe-area-inset-bottom));
+        }
+        [data-localefence-menu] {
+          inset: 0;
+          transform: none;
+          width: 100vw;
+          height: 100vh;
+          height: 100dvh;
+          border-width: 0;
+          border-radius: 0;
+        }
+        [data-localefence-header] {
+          padding-top: calc(14px + env(safe-area-inset-top));
+        }
+        [data-localefence-controls] {
+          padding-inline: 12px;
+        }
+        [data-localefence-tabs] {
+          justify-content: flex-start;
+          overflow-x: auto;
+          border-radius: 12px;
+          scrollbar-width: none;
+        }
+        [data-localefence-tabs]::-webkit-scrollbar {
+          display: none;
+        }
+        [data-localefence-tabs] button {
+          flex: 0 0 auto;
+        }
+        [data-localefence-footer] {
+          flex-wrap: wrap;
+          padding-bottom: calc(12px + env(safe-area-inset-bottom));
+        }
+        [data-localefence-toasts] {
+          right: 16px;
+          bottom: calc(16px + env(safe-area-inset-bottom));
+        }
+      }
     `;
     styleRoot.appendChild(style);
   };
 
-  const findNav = (root) => {
+  const resolveLocaleFenceMount = ({ allowStandalone, androidBrowser, body, compactViewport, nav }) => {
+    const mountNav = compactViewport ? null : nav;
+    const mount = mountNav || ((androidBrowser || compactViewport || allowStandalone || nav) ? body : null);
+    return { mount, mountNav };
+  };
+  const findNav = (root, allowStandalone = false) => {
     const nav = root?.closest?.('nav:has(a[href="/home"])') || root?.querySelector?.('nav:has(a[href="/home"])');
-    if (!nav || nav.querySelector("[data-localefence-root]")) return;
+    const compactViewport = globalThis.matchMedia?.("(max-width: 600px)")?.matches;
+    const androidBrowser = /Android/i.test(globalThis.navigator?.userAgent || "");
+    const { mount, mountNav } = resolveLocaleFenceMount({
+      allowStandalone,
+      androidBrowser,
+      body: document.body,
+      compactViewport,
+      nav,
+    });
+    if (!mount || document.querySelector("[data-localefence-root]")) return;
     const wrapper = document.createElement("div");
     wrapper.dataset.localefenceRoot = "true";
+    wrapper.dataset.localefenceStandalone = (!mountNav).toString();
     wrapper.dataset.theme = getPageTheme();
     wrapper.innerHTML = `
       <button data-localefence-trigger type="button" aria-haspopup="dialog" aria-expanded="false">
@@ -2504,6 +2953,11 @@
               <input data-notifications-enabled type="checkbox" role="switch">
             </label>
           </div>
+          <div data-reset-panel>
+            <strong>Reset local data</strong>
+            <p>Delete filters, settings, cache, queue, history, exclusions, and remembered block IDs from this browser. Existing X blocks are not undone.</p>
+            <button data-reset-all type="button">Reset LocaleFence</button>
+          </div>
         </div>
         <div data-localefence-footer>
           <span data-localefence-stats data-country-view>
@@ -2575,6 +3029,7 @@
         lookup: "Waiting for location",
         checking: "Checking location",
         retrying: "Retrying location",
+        rate_limited: "Waiting for X quota",
         failed: "Location check failed",
         awaiting_block: "Waiting to block",
       };
@@ -2593,10 +3048,12 @@
           const status = document.createElement("span");
           status.dataset.queueStatus = "true";
           status.textContent = statusLabels[record.status] || "Waiting";
-          if (record.attempts) status.textContent += ` · ${record.attempts}/${maxLookupRetries}`;
+          if (record.attempts && record.status !== "rate_limited") {
+            status.textContent += ` · ${record.attempts}/${maxLookupRetries}`;
+          }
           if (record.lastError) status.title = record.lastError;
           const time = document.createElement("time");
-          const queuedAt = new Date(Number(record.enqueuedAt) || 0);
+          const queuedAt = safeDate(record.enqueuedAt);
           time.dataset.historyMeta = "true";
           time.dateTime = queuedAt.toISOString();
           time.textContent = queuedAt.toLocaleString();
@@ -2665,7 +3122,7 @@
         status.dataset.status = entry.status || "blocked";
         status.textContent = statusLabels[entry.status] || "Blocked";
         const time = document.createElement("time");
-        const blockedAt = new Date(Number(entry.blockedAt) || 0);
+        const blockedAt = safeDate(entry.blockedAt);
         time.dataset.historyMeta = "true";
         time.dateTime = blockedAt.toISOString();
         time.textContent = blockedAt.toLocaleString();
@@ -2917,6 +3374,12 @@
         document.querySelectorAll('[data-account-state][data-state="excluded"]').forEach((badge) => badge.remove());
         updateActionControls();
         refreshProcessedAccounts();
+      } else if (target.matches("[data-reset-all]")) {
+        const confirmed = globalThis.confirm(
+          "Delete all LocaleFence data stored in this browser? Existing blocks on X will remain in place.",
+        );
+        if (!confirmed) return;
+        await resetLocaleFenceData();
       } else if (target.matches("[data-sort-column]")) {
         cycleSort(target.dataset.sortColumn);
         renderStats();
@@ -2967,6 +3430,7 @@
         blockEnabled = true;
         blockPaused = false;
         blockErrorMessage = "";
+        writeStorage(blockPausedStorageKey, false);
         writeStorage(blockEnabledStorageKey, true);
         refreshProcessedAccounts();
         resumeAwaitingBlocks();
@@ -2997,7 +3461,8 @@
         first.focus();
       }
     });
-    nav.insertBefore(wrapper, nav.lastElementChild);
+    if (mountNav) mountNav.insertBefore(wrapper, mountNav.lastElementChild);
+    else mount.appendChild(wrapper);
     renderHistory();
     renderQueue();
     setActiveView("countries");
@@ -3005,18 +3470,84 @@
     updateLookupStatus();
   };
 
+  let mountFailureReported = false;
+  const tryMountLocaleFence = (root, allowStandalone = false) => {
+    try {
+      findNav(root, allowStandalone);
+      return true;
+    } catch (error) {
+      if (!mountFailureReported) {
+        mountFailureReported = true;
+        console.warn("LocaleFence could not mount its controls; it will retry.", error);
+      }
+      return false;
+    }
+  };
+
   ensureLocaleFenceStyles();
-  findNav(document);
+  tryMountLocaleFence(document);
   findTweets(document);
+  const scanDocument = () => {
+    ensureLocaleFenceStyles();
+    tryMountLocaleFence(document);
+    findTweets(document);
+  };
+  let mountWatchdogAttempts = 0;
+  const ensureRuntimeMount = () => {
+    if (document.querySelector("[data-localefence-root]")) return;
+    ensureLocaleFenceStyles();
+    tryMountLocaleFence(document, true);
+    mountWatchdogAttempts += 1;
+    if (
+      !document.querySelector("[data-localefence-root]") &&
+      mountWatchdogAttempts < 20 &&
+      (document.readyState !== "complete" || document.body)
+    ) {
+      setTimeout(ensureRuntimeMount, 250);
+    }
+  };
+  const resumeVisibleWork = () => {
+    if (document.visibilityState === "hidden") return;
+    ensureLocaleFenceStyles();
+    tryMountLocaleFence(document, true);
+    findTweets(document);
+    syncLookupBackoffUntil();
+    if (lookupBackoffUntil) setLookupStatus(describeLookupBackoff());
+    else if (lookupStatusMessage.startsWith("X paused location lookups")) setLookupStatus();
+    if (queue.length) scheduleQueue(Math.max(lookupBackoffUntil - Date.now(), 0));
+  };
+  if (document.readyState === "complete") resumeVisibleWork();
+  else if (document.readyState === "interactive") scanDocument();
+  document.addEventListener?.("DOMContentLoaded", scanDocument, { once: true });
+  document.addEventListener?.("visibilitychange", resumeVisibleWork);
+  globalThis.addEventListener("load", resumeVisibleWork, { once: true });
+  globalThis.addEventListener("pageshow", resumeVisibleWork);
+  globalThis.addEventListener("online", resumeVisibleWork);
+  setTimeout(ensureRuntimeMount, 500);
   hydrationReady = hydrateCache()
     .catch(() => {})
-    .finally(() => findTweets(document));
+    .finally(() => {
+      findTweets(document);
+      if (document.readyState === "complete") resumeVisibleWork();
+    });
 
   new MutationObserver((mutations) => {
-    for (const { addedNodes } of mutations)
+    let runtimeWasRemoved = false;
+    for (const { addedNodes, removedNodes } of mutations) {
+      for (const node of removedNodes) {
+        if (
+          node?.matches?.("[data-localefence-root]") ||
+          node?.querySelector?.("[data-localefence-root]")
+        ) runtimeWasRemoved = true;
+      }
       for (const node of addedNodes) {
         findTweets(node);
-        findNav(node);
+        tryMountLocaleFence(node);
       }
+    }
+    if (runtimeWasRemoved) {
+      ensureLocaleFenceStyles();
+      tryMountLocaleFence(document, true);
+    }
   }).observe(document, { childList: true, subtree: true });
 })();
