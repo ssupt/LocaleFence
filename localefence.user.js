@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LocaleFence for X
 // @namespace    https://github.com/ssupt/LocaleFence
-// @version      1.2.3
+// @version      1.2.4
 // @description  See X account countries, hide matching posts, and optionally block matching accounts
 // @author       ssupt
 // @license      GPL-3.0-only
@@ -24,7 +24,7 @@
   // running when someone has installed both distributions. A synchronous
   // ping distinguishes a live runtime from a stale marker restored by a
   // discarded mobile tab.
-  const runtimeVersion = "1.2.3";
+  const runtimeVersion = "1.2.4";
   const runtimePingEvent = "localefence:runtime-ping";
   const runtimeRoot = document.documentElement;
   const pingExistingRuntime = () => {
@@ -182,6 +182,7 @@
   const lookupAttempts = new Map();
   const lookupRetryTimers = new Map();
   const lookupRecords = new Map();
+  const unavailableAccounts = new Map();
   const blockQueue = [];
   const queuedBlockIds = new Set();
   const blockHistory = [];
@@ -266,8 +267,12 @@
   const dayMs = 24 * 60 * 60 * 1000;
   const cacheTtlMs = 28 * dayMs;
   const defaultRateLimitDelayMs = 15 * 1000;
-  const maximumRateLimitDelayMs = dayMs;
+  const maximumRateLimitDelayMs = 7 * dayMs;
   const lookupBackoffStorageKey = "localefence.lookupBackoffUntil";
+  const lookupFallbackAttemptsStorageKey = "localefence.lookupFallbackAttempts";
+  const sharedLookupCacheStorageKey = "localefence.sharedLookupCache";
+  const unavailableAccountsStorageKey = "localefence.unavailableAccounts";
+  const lookupQuotaStorageKey = "localefence.lookupQuota";
   const clamp = (value, minimum, maximum) => Math.min(Math.max(value, minimum), maximum);
   const readFutureTimestamp = (key) => {
     const timestamp = Number(readStorage(key));
@@ -276,7 +281,10 @@
       ? timestamp
       : 0;
   };
+  const readLookupFallbackAttempts = () =>
+    Math.floor(clamp(Number(readStorage(lookupFallbackAttemptsStorageKey)) || 0, 0, 9));
   let lookupBackoffUntil = readFutureTimestamp(lookupBackoffStorageKey);
+  let lookupFallbackAttempts = readLookupFallbackAttempts();
   // Versions 1.2.0-1.2.1 persisted adaptive pacing. Normal requests are now
   // immediate again; only an explicit quota exhaustion or retry cooldown waits.
   removeStorage("localefence.lookupRequestDelayMs");
@@ -294,15 +302,29 @@
     lookupBackoffUntil = readFutureTimestamp(lookupBackoffStorageKey);
     return lookupBackoffUntil;
   };
+  const resetLookupFallbackAttempts = () => {
+    lookupFallbackAttempts = 0;
+    removeStorage(lookupFallbackAttemptsStorageKey);
+  };
+  const formatRetryTime = (timestamp) => {
+    const date = new Date(timestamp);
+    const today = new Date();
+    const sameDay = date.getFullYear() === today.getFullYear() &&
+      date.getMonth() === today.getMonth() && date.getDate() === today.getDate();
+    return sameDay
+      ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+      : date.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+  };
   const describeLookupBackoff = () =>
-    `X paused location lookups until ${new Date(lookupBackoffUntil).toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    })} to respect its rate limit. Accounts remain queued locally and will resume while X is open.`;
+    `Location lookups are rate-limited. LocaleFence will retry at ${formatRetryTime(lookupBackoffUntil)}. ` +
+    "Accounts remain queued locally and will resume while X is open.";
   if (lookupBackoffUntil) lookupStatusMessage = describeLookupBackoff();
   const maxLookupRetries = 6;
   const maxLookupQueueEntries = 500;
   const maxCachedAccounts = 5000;
+  const maxSharedLookupCacheEntries = 64;
+  const maxUnavailableAccountEntries = 256;
+  const unavailableAccountTtlMs = 60 * 60 * 1000;
   const maxBlockHistoryEntries = 250;
   const maxPendingTargetsPerAccount = 25;
   const countryRequestTimeoutMs = 20000;
@@ -315,6 +337,14 @@
   const storedHideEnabled = readStorage("localefence.hideEnabled");
   let hideEnabled = storedHideEnabled == null || storedHideEnabled === "true";
   let notificationsEnabled = readStorage("localefence.notificationsEnabled") !== "false";
+  const notificationSizes = new Set(["compact", "standard", "large"]);
+  const storedNotificationSize = readStorage("localefence.notificationSize");
+  let notificationSize = notificationSizes.has(storedNotificationSize) ? storedNotificationSize : "compact";
+  const notificationPositions = new Set(["top-left", "top-right", "bottom-left", "bottom-right"]);
+  const storedNotificationPosition = readStorage("localefence.notificationPosition");
+  let notificationPosition = notificationPositions.has(storedNotificationPosition)
+    ? storedNotificationPosition
+    : "top-right";
   const storedCountrySort = readStorage("localefence.countrySort");
   let countrySort = [
     "default",
@@ -332,6 +362,7 @@
   let renderBlockHistory = () => {};
   let renderLookupQueue = () => {};
   let renderLookupStatus = () => {};
+  let renderLookupQuota = () => {};
   const saveExcludedUserIds = () =>
     writeStorage("localefence.excludedUserIds", [...excludedUserIds].join("\n"));
 
@@ -705,6 +736,8 @@
       root.appendChild(host);
     }
     host.dataset.theme = getPageTheme();
+    host.dataset.size = notificationSize;
+    host.dataset.position = notificationPosition;
     const toast = document.createElement("div");
     toast.dataset.localefenceToast = "true";
     toast.dataset.error = error.toString();
@@ -783,6 +816,134 @@
     Object.fromEntries(Object.entries(object).filter(([, value]) => value !== undefined && value !== ""));
   const usernameKey = (username) =>
     typeof username === "string" && /^[A-Za-z0-9_]{1,15}$/.test(username) ? username.toLowerCase() : "";
+  const parseStoredArray = (key) => {
+    try {
+      const value = JSON.parse(readStorage(key) || "[]");
+      return Array.isArray(value) ? value : [];
+    } catch {
+      return [];
+    }
+  };
+  const normalizeSharedUser = (user) => {
+    const updatedAt = Number(user?.updatedAt);
+    if (
+      !isRestId(user?.restId) ||
+      !usernameKey(user?.screenName) ||
+      !Number.isFinite(updatedAt) ||
+      updatedAt <= 0 ||
+      updatedAt > Date.now() + 5 * 60 * 1000 ||
+      Date.now() - updatedAt > cacheTtlMs
+    ) return null;
+    return compact({
+      restId: user.restId,
+      screenName: user.screenName,
+      name: user.name,
+      country: resolveCountryAlias(user.country),
+      updatedAt,
+    });
+  };
+  const cacheAboutUserInMemory = (user) => {
+    const key = usernameKey(user?.screenName);
+    if (!key || !user?.restId) return false;
+    const existing = aboutUsers.get(user.restId);
+    if (existing && Number(existing.updatedAt) > Number(user.updatedAt)) return false;
+    screenNames.forEach((mappedRestId, mappedKey) => {
+      if (mappedRestId === user.restId && mappedKey !== key) screenNames.delete(mappedKey);
+    });
+    aboutUsers.set(user.restId, user);
+    screenNames.set(key, user.restId);
+    return true;
+  };
+  const readSharedLookupCache = () =>
+    parseStoredArray(sharedLookupCacheStorageKey)
+      .map(normalizeSharedUser)
+      .filter(Boolean)
+      .sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt))
+      .slice(0, maxSharedLookupCacheEntries);
+  const syncSharedLookupCache = (username = "") => {
+    const requestedKey = usernameKey(username);
+    let requestedUser = null;
+    readSharedLookupCache().forEach((user) => {
+      cacheAboutUserInMemory(user);
+      if (usernameKey(user.screenName) === requestedKey) requestedUser = user;
+    });
+    return requestedUser;
+  };
+  const rememberSharedAboutUser = (user) => {
+    const key = usernameKey(user?.screenName);
+    if (!key || !user?.restId) return;
+    const entries = readSharedLookupCache().filter((entry) =>
+      entry.restId !== user.restId && usernameKey(entry.screenName) !== key);
+    entries.unshift(user);
+    writeStorage(sharedLookupCacheStorageKey, JSON.stringify(entries.slice(0, maxSharedLookupCacheEntries)));
+  };
+  const readUnavailableAccounts = () => {
+    const now = Date.now();
+    return parseStoredArray(unavailableAccountsStorageKey)
+      .map((entry) => ({
+        key: usernameKey(entry?.key),
+        reason: String(entry?.reason || "Account data unavailable").slice(0, 160),
+        until: Number(entry?.until),
+      }))
+      .filter((entry) => entry.key && entry.until > now && entry.until <= now + unavailableAccountTtlMs)
+      .sort((a, b) => Number(b.until) - Number(a.until))
+      .slice(0, maxUnavailableAccountEntries);
+  };
+  const syncUnavailableAccounts = () => {
+    unavailableAccounts.clear();
+    readUnavailableAccounts().forEach((entry) => unavailableAccounts.set(entry.key, entry));
+  };
+  const rememberUnavailableAccount = (username, reason = "Account data unavailable") => {
+    const key = usernameKey(username);
+    if (!key) return;
+    const entry = {
+      key,
+      reason: String(reason || "Account data unavailable").slice(0, 160),
+      until: Date.now() + unavailableAccountTtlMs,
+    };
+    const entries = readUnavailableAccounts().filter((item) => item.key !== key);
+    entries.unshift(entry);
+    writeStorage(unavailableAccountsStorageKey, JSON.stringify(entries.slice(0, maxUnavailableAccountEntries)));
+    unavailableAccounts.set(key, entry);
+  };
+  const forgetUnavailableAccount = (username) => {
+    const key = usernameKey(username);
+    if (!key) return;
+    unavailableAccounts.delete(key);
+    const entries = readUnavailableAccounts().filter((entry) => entry.key !== key);
+    if (entries.length) writeStorage(unavailableAccountsStorageKey, JSON.stringify(entries));
+    else removeStorage(unavailableAccountsStorageKey);
+  };
+  const isUnavailableAccount = (username) => {
+    const key = usernameKey(username);
+    const entry = unavailableAccounts.get(key);
+    if (!entry) return false;
+    if (Number(entry.until) > Date.now()) return true;
+    forgetUnavailableAccount(key);
+    return false;
+  };
+  const parseLookupQuota = (value) => {
+    try {
+      const quota = JSON.parse(value || "null");
+      const observedAt = Number(quota?.observedAt);
+      if (!Number.isFinite(observedAt) || observedAt <= 0 || Date.now() - observedAt > maximumRateLimitDelayMs) {
+        return null;
+      }
+      return {
+        limit: quota.limit != null && Number.isFinite(Number(quota.limit)) ? Number(quota.limit) : null,
+        observedAt,
+        remaining: quota.remaining != null && Number.isFinite(Number(quota.remaining))
+          ? Number(quota.remaining)
+          : null,
+        resetAt: quota.resetAt != null && Number.isFinite(Number(quota.resetAt)) ? Number(quota.resetAt) : 0,
+      };
+    } catch {
+      return null;
+    }
+  };
+  let lookupQuota = parseLookupQuota(readStorage(lookupQuotaStorageKey));
+  syncSharedLookupCache();
+  syncUnavailableAccounts();
   // Persistent cache, lookup queue, and block history
   const dbPromise = new Promise((resolve) => {
     let request;
@@ -943,12 +1104,17 @@
   const saveAboutResponse = async (json) => {
     const aboutUser = processAboutUser(json?.data?.user_result_by_screen_name?.result);
     if (!aboutUser) return null;
-    aboutUsers.set(aboutUser.restId, aboutUser);
+    cacheAboutUserInMemory(aboutUser);
+    forgetUnavailableAccount(aboutUser.screenName);
+    rememberSharedAboutUser(aboutUser);
     const removedRestIds = pruneAboutUsers();
     await saveAboutUser(aboutUser, removedRestIds);
     return aboutUser;
   };
   const clearCacheStores = async () => {
+    unavailableAccounts.clear();
+    removeStorage(sharedLookupCacheStorageKey);
+    removeStorage(unavailableAccountsStorageKey);
     try {
       const db = await dbPromise;
       if (!db) return;
@@ -1119,6 +1285,7 @@
   const clearLookupRecords = async () => {
     clearBlockQueue();
     setLookupBackoffUntil(0);
+    resetLookupFallbackAttempts();
     lookupRecords.forEach((record) => {
       const timer = lookupRetryTimers.get(record.key);
       if (timer) clearTimeout(timer);
@@ -1194,6 +1361,9 @@
     blockOwnerRestId = "";
     hideEnabled = true;
     notificationsEnabled = true;
+    notificationSize = "compact";
+    notificationPosition = "top-right";
+    lookupQuota = null;
     countrySort = "default";
     blockSuccessCount = 0;
     totalBlockedCount = 0;
@@ -1209,6 +1379,7 @@
     renderLookupQueue();
     renderBlockHistory();
     renderActionControls();
+    renderLookupQuota();
   };
   const ensureBlockOwner = () => {
     if (!blockEnabled) return false;
@@ -1227,6 +1398,10 @@
       blockedAccountKeys.clear();
       hideEnabled = true;
       notificationsEnabled = true;
+      notificationSize = "compact";
+      notificationPosition = "top-right";
+      lookupQuota = null;
+      unavailableAccounts.clear();
       totalBlockedCount = 0;
       if (blockEnabled) disableBlocking();
       blockPaused = false;
@@ -1234,6 +1409,7 @@
       refreshProcessedAccounts();
       renderLocationStats();
       renderActionControls();
+      renderLookupQuota();
     } else if (event.key === blockOwnerStorageKey) {
       const ownerChanged = blockOwnerRestId && blockOwnerRestId !== (event.newValue || "");
       blockOwnerRestId = event.newValue || "";
@@ -1281,6 +1457,8 @@
         setLookupStatus();
         if (document.visibilityState !== "hidden") scheduleQueue();
       }
+    } else if (event.key === lookupFallbackAttemptsStorageKey) {
+      lookupFallbackAttempts = Math.floor(clamp(Number(event.newValue) || 0, 0, 9));
     } else if (event.key === "localefence.locations") {
       selectedLocations.clear();
       (event.newValue || "").split("\n").map(resolveCountryAlias).filter(Boolean).forEach((location) => {
@@ -1297,6 +1475,31 @@
       notificationsEnabled = event.newValue !== "false";
       if (!notificationsEnabled) document.querySelector("[data-localefence-toasts]")?.remove();
       renderActionControls();
+    } else if (event.key === "localefence.notificationSize") {
+      notificationSize = notificationSizes.has(event.newValue) ? event.newValue : "compact";
+      const toastHost = document.querySelector("[data-localefence-toasts]");
+      if (toastHost) toastHost.dataset.size = notificationSize;
+      renderActionControls();
+    } else if (event.key === "localefence.notificationPosition") {
+      notificationPosition = notificationPositions.has(event.newValue) ? event.newValue : "top-right";
+      const toastHost = document.querySelector("[data-localefence-toasts]");
+      if (toastHost) toastHost.dataset.position = notificationPosition;
+      renderActionControls();
+    } else if (event.key === sharedLookupCacheStorageKey) {
+      if (event.newValue == null) {
+        aboutUsers.clear();
+        screenNames.clear();
+        document.querySelectorAll("[data-account-based-in]").forEach((node) => node.remove());
+        findTweets(document);
+        renderLocationStats();
+      } else {
+        syncSharedLookupCache();
+      }
+    } else if (event.key === unavailableAccountsStorageKey) {
+      syncUnavailableAccounts();
+    } else if (event.key === lookupQuotaStorageKey) {
+      lookupQuota = parseLookupQuota(event.newValue);
+      renderLookupQuota();
     } else if (event.key === "localefence.excludedUserIds") {
       excludedUserIds.clear();
       (event.newValue || "").split("\n").filter(Boolean).forEach((restId) => excludedUserIds.add(restId));
@@ -1658,6 +1861,19 @@
     }
     return null;
   };
+  const getReusableLookupResult = (username, queuedAt = 0) => {
+    const cached = getCachedAccount(username);
+    if (!cached || cached.expired) return null;
+    const user = aboutUsers.get(cached.restId);
+    if (!user) return null;
+    const needsFreshBlockProof =
+      blockEnabled &&
+      !blockPaused &&
+      isLocationMatched(cached.country) &&
+      !isKnownBlocked(blockOwnerRestId, cached.restId);
+    if (needsFreshBlockProof && Number(user.updatedAt) <= Number(queuedAt)) return null;
+    return { country: user.country, found: true, shared: true, user };
+  };
 
   // Cache hydration and location lookup processing
   const hydrateCache = async () => {
@@ -1730,16 +1946,53 @@
   const readRateLimit = (headers) => {
     const now = Date.now();
     const remainingValue = headers?.get?.("x-rate-limit-remaining");
+    const limitValue = headers?.get?.("x-rate-limit-limit");
     const resetValue = headers?.get?.("x-rate-limit-reset");
     const remaining = remainingValue == null ? NaN : Number(remainingValue);
+    const limit = limitValue == null ? NaN : Number(limitValue);
     const resetSeconds = resetValue == null ? NaN : Number(resetValue);
     const resetAt = Number.isFinite(resetSeconds) && resetSeconds > 0 ? resetSeconds * 1000 : 0;
     const resetDelayMs = resetAt > now ? resetAt - now + 1000 : 0;
     return {
+      rateLimitLimit: Number.isFinite(limit) ? limit : null,
       rateLimitRemaining: Number.isFinite(remaining) ? remaining : null,
+      rateLimitResetAt: resetAt,
       rateLimitResetAfterMs: resetDelayMs,
       retryAfterMs: parseRetryAfterMs(headers),
     };
+  };
+  const describeLookupQuota = () => {
+    if (!lookupQuota) {
+      return "X has not reported location-lookup quota details yet.";
+    }
+    if (lookupQuota.resetAt > 0 && lookupQuota.resetAt <= Date.now()) {
+      return "X's last reported quota window has reset. The next location lookup will refresh the count.";
+    }
+    if (lookupQuota.remaining == null) {
+      return lookupQuota.resetAt > Date.now()
+        ? `X did not report a remaining count. The current window resets around ${formatRetryTime(lookupQuota.resetAt)}.`
+        : "X did not report a remaining lookup count.";
+    }
+    const total = lookupQuota.limit != null ? ` of ${lookupQuota.limit.toLocaleString()}` : "";
+    const reset = lookupQuota.resetAt > Date.now()
+      ? ` The current window resets around ${formatRetryTime(lookupQuota.resetAt)}.`
+      : "";
+    return `X reports ${lookupQuota.remaining.toLocaleString()}${total} location lookups remaining.${reset}`;
+  };
+  const rememberLookupQuota = (rateLimit) => {
+    if (
+      rateLimit.rateLimitLimit == null &&
+      rateLimit.rateLimitRemaining == null &&
+      !rateLimit.rateLimitResetAt
+    ) return;
+    lookupQuota = {
+      limit: rateLimit.rateLimitLimit,
+      observedAt: Date.now(),
+      remaining: rateLimit.rateLimitRemaining,
+      resetAt: rateLimit.rateLimitResetAt || 0,
+    };
+    writeStorage(lookupQuotaStorageKey, JSON.stringify(lookupQuota));
+    renderLookupQuota();
   };
   const scheduleLookupRetry = (username, result) => {
     const key = usernameKey(username);
@@ -1750,8 +2003,22 @@
     const rateLimited = result.status === 429;
     if (rateLimited) {
       clearLookupRetry(username);
+      const serverProvidedDelay = Number(result.retryAfterMs) > 0;
+      if (serverProvidedDelay) {
+        resetLookupFallbackAttempts();
+      } else {
+        lookupFallbackAttempts = Math.min(
+          Math.max(lookupFallbackAttempts, readLookupFallbackAttempts()) + 1,
+          9,
+        );
+        writeStorage(lookupFallbackAttemptsStorageKey, lookupFallbackAttempts);
+      }
+      const fallbackDelay = Math.min(
+        defaultRateLimitDelayMs * 2 ** Math.max(lookupFallbackAttempts - 1, 0),
+        60 * 60 * 1000,
+      );
       const delay = clamp(
-        result.retryAfterMs || defaultRateLimitDelayMs,
+        result.retryAfterMs || fallbackDelay,
         1000,
         maximumRateLimitDelayMs,
       );
@@ -1822,8 +2089,11 @@
         credentials: "include",
       }, countryRequestTimeoutMs);
       const rateLimit = readRateLimit(res.headers);
+      rememberLookupQuota(rateLimit);
       if (res.status === 429) {
         rateLimit.retryAfterMs = Math.max(rateLimit.retryAfterMs, rateLimit.rateLimitResetAfterMs);
+      } else {
+        resetLookupFallbackAttempts();
       }
       if (!res.ok) {
         if (res.status === 405 && method === "POST") {
@@ -1839,14 +2109,23 @@
       const aboutUser = await saveAboutResponse(json);
       if (aboutUser) return { country: aboutUser.country, found: true, user: aboutUser, ...rateLimit };
       const graphQlErrors = json?.errors?.map((error) => error?.message).filter(Boolean);
+      const rawProfileResult = json?.data?.user_result_by_screen_name?.result;
+      const unavailableDetails = [
+        rawProfileResult?.__typename,
+        rawProfileResult?.reason,
+        ...(graphQlErrors || []),
+      ].filter(Boolean).join("; ");
+      const unavailable = /not[ _-]?found|does not exist|no user|suspend|deactivat|unavailable/i.test(
+        unavailableDetails,
+      );
       if (
         !recoveredQueryId &&
         graphQlErrors?.some((message) => /operation|persisted|query/i.test(message)) &&
         recoverAboutQueryId(requestedQueryId)
       ) return fetchCountry(username, { method, recoveredQueryId: true });
       return graphQlErrors?.length
-        ? { found: false, retryable: false, reason: graphQlErrors.join("; "), ...rateLimit }
-        : { found: false, ...rateLimit };
+        ? { found: false, retryable: false, reason: graphQlErrors.join("; "), unavailable, ...rateLimit }
+        : { found: false, unavailable, ...rateLimit };
     } catch (error) {
       return {
         found: false,
@@ -1886,6 +2165,16 @@
             continue;
           }
         }
+        const reusableResult = getReusableLookupResult(username, lookupRecords.get(key)?.enqueuedAt);
+        if (reusableResult) {
+          clearLookupRetry(username);
+          targets.forEach(({ container, tweet }) => {
+            applyCountry(container, tweet, reusableResult.country, username);
+          });
+          resolveLookupRecord(username, reusableResult.country, targets, reusableResult.user);
+          pending.delete(key);
+          continue;
+        }
         const result = await withLookupRequestLock(async () => {
           syncLookupBackoffUntil();
           const backoffDelay = lookupBackoffUntil - Date.now();
@@ -1894,6 +2183,11 @@
             return { deferred: true, retryAfterMs: Math.max(waitTime, 0) };
           }
           if (!lookupRecords.has(key) || !pending.has(key)) return { cancelled: true };
+          syncSharedLookupCache(username);
+          syncUnavailableAccounts();
+          const sharedResult = getReusableLookupResult(username, lookupRecords.get(key)?.enqueuedAt);
+          if (sharedResult) return sharedResult;
+          if (isUnavailableAccount(username)) return { found: false, unavailable: true };
           updateLookupRecord(username, { status: "checking" });
           return fetchCountry(username);
         });
@@ -1930,6 +2224,7 @@
             });
             setLookupStatus(`X rejected location lookups with HTTP ${result.status}. Reload X if this continues.`, true);
           } else {
+            if (result.unavailable) rememberUnavailableAccount(username, result.reason);
             removeLookupRecord(username);
           }
           pending.delete(key);
@@ -1944,6 +2239,7 @@
   const enqueue = (username, container, tweet) => {
     const key = usernameKey(username);
     if (!key) return;
+    if (isUnavailableAccount(username)) return;
     const cached = getCachedAccount(username);
     const existingBadge = container?.querySelector?.("[data-account-based-in]");
     if (
@@ -2107,6 +2403,9 @@
         align-items: center;
         gap: 20px;
         padding: 12px;
+        position: relative;
+        isolation: isolate;
+        overflow: hidden;
         color: inherit;
         font-family: inherit;
         font-size: 20px;
@@ -2117,17 +2416,47 @@
         border-radius: 9999px;
         cursor: pointer;
       }
+      [data-localefence-trigger]::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        z-index: 0;
+        border-radius: inherit;
+        background: currentColor;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.2s ease;
+      }
+      [data-localefence-trigger]:hover::before,
+      [data-localefence-trigger]:focus-visible::before {
+        opacity: 0.1;
+      }
+      [data-localefence-trigger] > * {
+        position: relative;
+        z-index: 1;
+      }
       [data-localefence-trigger] > svg {
         width: 1.75rem;
         height: 1.75rem;
         flex-shrink: 0;
+        transform: scale(1.25);
+        transform-origin: center;
       }
-      [data-localefence-trigger]:hover,
       [data-localefence-close]:hover {
         background: var(--lf-hover);
       }
       [data-localefence-label] {
+        margin-right: 16px;
         white-space: nowrap;
+      }
+      [data-localefence-root][data-localefence-compact="true"] {
+        align-items: center;
+      }
+      [data-localefence-root][data-localefence-compact="true"] [data-localefence-trigger] {
+        gap: 0;
+      }
+      [data-localefence-root][data-localefence-compact="true"] [data-localefence-label] {
+        display: none;
       }
       @media (max-width: 1276px) {
         [data-localefence-root] {
@@ -2218,6 +2547,7 @@
         background: transparent;
         color: inherit;
         cursor: pointer;
+        transition: background-color 0.18s ease;
       }
       [data-localefence-close] svg {
         width: 20px;
@@ -2299,6 +2629,18 @@
       [data-localefence-action] input[type="checkbox"]:checked::after {
         transform: translateX(18px);
       }
+      [data-notification-size],
+      [data-notification-position] {
+        min-width: 104px;
+        padding: 7px 28px 7px 10px;
+        border: 1px solid var(--lf-border-strong);
+        border-radius: 9999px;
+        background: var(--lf-surface);
+        color: var(--lf-text);
+        font: inherit;
+        font-size: 13px;
+        cursor: pointer;
+      }
       [data-exclusion-summary] {
         display: flex;
         align-items: center;
@@ -2337,6 +2679,12 @@
         font-size: 13px;
         font-weight: 700;
         cursor: pointer;
+        transition: background-color 0.18s ease, color 0.18s ease;
+      }
+      [data-localefence-tabs] button:hover,
+      [data-localefence-tabs] button:focus-visible {
+        background: var(--lf-hover);
+        color: var(--lf-text);
       }
       [data-localefence-tabs] button[data-active="true"] {
         background: var(--lf-border);
@@ -2350,6 +2698,9 @@
       }
       [data-settings-panel] {
         flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+        overscroll-behavior: contain;
         padding: 16px;
       }
       [data-reset-panel] {
@@ -2363,6 +2714,22 @@
         border-radius: 12px;
       }
       [data-reset-panel] p {
+        margin: 0;
+        color: var(--lf-muted);
+        font-size: 12px;
+        line-height: 17px;
+      }
+      [data-lookup-quota-panel] {
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+        margin-top: 16px;
+        padding: 12px 14px;
+        border: 1px solid var(--lf-border);
+        border-radius: 12px;
+        background: var(--lf-subtle);
+      }
+      [data-lookup-quota-panel] p {
         margin: 0;
         color: var(--lf-muted);
         font-size: 12px;
@@ -2704,15 +3071,36 @@
         background: rgba(244, 33, 46, 0.1);
       }
       [data-localefence-toasts] {
+        --lf-toast-inline-offset: 24px;
+        --lf-toast-top-offset: 24px;
+        --lf-toast-top-right-offset: 72px;
+        --lf-toast-bottom-offset: 24px;
         position: fixed;
-        right: 24px;
-        bottom: 24px;
+        left: var(--lf-toast-inline-offset);
+        top: var(--lf-toast-top-offset);
         z-index: 10002;
         display: flex;
         flex-direction: column;
-        align-items: flex-end;
+        align-items: flex-start;
         gap: 8px;
         pointer-events: none;
+      }
+      [data-localefence-toasts][data-position="top-right"] {
+        right: var(--lf-toast-inline-offset);
+        left: auto;
+        top: var(--lf-toast-top-right-offset);
+        align-items: flex-end;
+      }
+      [data-localefence-toasts][data-position="bottom-left"] {
+        top: auto;
+        bottom: var(--lf-toast-bottom-offset);
+      }
+      [data-localefence-toasts][data-position="bottom-right"] {
+        right: var(--lf-toast-inline-offset);
+        bottom: var(--lf-toast-bottom-offset);
+        left: auto;
+        top: auto;
+        align-items: flex-end;
       }
       [data-localefence-toast] {
         display: flex;
@@ -2728,8 +3116,36 @@
         font-family: TwitterChirp, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
         font-size: 14px;
         opacity: 0;
-        transform: translateY(8px);
+        transform: translateY(-8px);
         transition: opacity 0.2s, transform 0.2s;
+      }
+      [data-localefence-toasts][data-position^="bottom"] [data-localefence-toast] {
+        transform: translateY(8px);
+      }
+      [data-localefence-toasts][data-position^="bottom"] [data-localefence-toast][data-visible="true"] {
+        transform: translateY(0);
+      }
+      [data-localefence-toasts][data-size="compact"] [data-localefence-toast] {
+        gap: 8px;
+        max-width: min(340px, calc(100vw - 32px));
+        padding: 9px 12px;
+        font-size: 13px;
+      }
+      [data-localefence-toasts][data-size="compact"] [data-toast-post] {
+        font-size: 12px;
+        line-height: 16px;
+        -webkit-line-clamp: 2;
+      }
+      [data-localefence-toasts][data-size="large"] [data-localefence-toast] {
+        gap: 12px;
+        max-width: min(480px, calc(100vw - 32px));
+        padding: 16px 18px;
+        font-size: 16px;
+      }
+      [data-localefence-toasts][data-size="large"] [data-toast-post] {
+        font-size: 14px;
+        line-height: 20px;
+        -webkit-line-clamp: 5;
       }
       [data-toast-body],
       [data-toast-copy] {
@@ -2852,8 +3268,10 @@
           padding-bottom: calc(12px + env(safe-area-inset-bottom));
         }
         [data-localefence-toasts] {
-          right: 16px;
-          bottom: calc(16px + env(safe-area-inset-bottom));
+          --lf-toast-inline-offset: 16px;
+          --lf-toast-top-offset: calc(16px + env(safe-area-inset-top));
+          --lf-toast-top-right-offset: calc(16px + env(safe-area-inset-top));
+          --lf-toast-bottom-offset: calc(16px + env(safe-area-inset-bottom));
         }
       }
     `;
@@ -2861,9 +3279,39 @@
   };
 
   const resolveLocaleFenceMount = ({ allowStandalone, androidBrowser, body, compactViewport, nav }) => {
-    const mountNav = compactViewport ? null : nav;
+    const mountNav = nav;
     const mount = mountNav || ((androidBrowser || compactViewport || allowStandalone || nav) ? body : null);
     return { mount, mountNav };
+  };
+  const isCompactLocaleFenceNav = (nav) => {
+    const measuredWidth = Number(nav?.getBoundingClientRect?.()?.width ?? nav?.clientWidth);
+    if (Number.isFinite(measuredWidth) && measuredWidth > 0) return measuredWidth < 200;
+    return Boolean(globalThis.matchMedia?.("(max-width: 1276px)")?.matches);
+  };
+  const syncLocaleFenceNavLayout = (wrapper, nav) => {
+    if (!wrapper || !nav) return;
+    wrapper.dataset.localefenceCompact = isCompactLocaleFenceNav(nav).toString();
+  };
+  let localeFenceNavObserver = null;
+  let observedLocaleFenceNav = null;
+  let observedLocaleFenceRoot = null;
+  const observeLocaleFenceNavLayout = (wrapper, nav) => {
+    syncLocaleFenceNavLayout(wrapper, nav);
+    if (!globalThis.ResizeObserver || (wrapper === observedLocaleFenceRoot && nav === observedLocaleFenceNav)) return;
+    localeFenceNavObserver?.disconnect();
+    observedLocaleFenceRoot = wrapper;
+    observedLocaleFenceNav = nav;
+    localeFenceNavObserver = new globalThis.ResizeObserver(() => syncLocaleFenceNavLayout(wrapper, nav));
+    localeFenceNavObserver.observe(nav);
+  };
+  const placeLocaleFenceInNav = (wrapper, nav) => {
+    if (!wrapper || !nav) return;
+    wrapper.dataset.localefenceStandalone = "false";
+    observeLocaleFenceNavLayout(wrapper, nav);
+    if (wrapper.parentNode === nav) return;
+    const insertionPoint = nav.lastElementChild;
+    if (insertionPoint && insertionPoint !== wrapper) nav.insertBefore(wrapper, insertionPoint);
+    else nav.appendChild(wrapper);
   };
   const findNav = (root, allowStandalone = false) => {
     const nav = root?.closest?.('nav:has(a[href="/home"])') || root?.querySelector?.('nav:has(a[href="/home"])');
@@ -2876,7 +3324,13 @@
       compactViewport,
       nav,
     });
-    if (!mount || document.querySelector("[data-localefence-root]")) return;
+    const existingRoot = document.querySelector("[data-localefence-root]");
+    if (existingRoot) {
+      existingRoot.dataset.theme = getPageTheme();
+      if (mountNav) placeLocaleFenceInNav(existingRoot, mountNav);
+      return;
+    }
+    if (!mount) return;
     const wrapper = document.createElement("div");
     wrapper.dataset.localefenceRoot = "true";
     wrapper.dataset.localefenceStandalone = (!mountNav).toString();
@@ -2952,6 +3406,33 @@
               </span>
               <input data-notifications-enabled type="checkbox" role="switch">
             </label>
+            <label data-localefence-action>
+              <span data-action-copy>
+                <span data-action-title>Notification size</span>
+                <span data-action-help>Choose how much space notifications use.</span>
+              </span>
+              <select data-notification-size aria-label="Notification size">
+                <option value="compact">Compact</option>
+                <option value="standard">Standard</option>
+                <option value="large">Large</option>
+              </select>
+            </label>
+            <label data-localefence-action>
+              <span data-action-copy>
+                <span data-action-title>Notification position</span>
+                <span data-action-help>Choose which corner notifications appear in.</span>
+              </span>
+              <select data-notification-position aria-label="Notification position">
+                <option value="top-right">Top right</option>
+                <option value="top-left">Top left</option>
+                <option value="bottom-left">Bottom left</option>
+                <option value="bottom-right">Bottom right</option>
+              </select>
+            </label>
+          </div>
+          <div data-lookup-quota-panel>
+            <strong>Location lookup quota</strong>
+            <p data-lookup-quota aria-live="polite"></p>
           </div>
           <div data-reset-panel>
             <strong>Reset local data</strong>
@@ -2983,10 +3464,13 @@
     const hideToggle = $("[data-hide-matching]");
     const blockToggle = $("[data-block-matching]");
     const notificationsToggle = $("[data-notifications-enabled]");
+    const notificationSizeSelect = $("[data-notification-size]");
+    const notificationPositionSelect = $("[data-notification-position]");
     const blockStatus = $("[data-block-status]");
     const exclusionSummary = $("[data-exclusion-summary]");
     const exclusionCount = $("[data-exclusion-count]");
     const lookupStatus = $("[data-lookup-status]");
+    const lookupQuotaLabel = $("[data-lookup-quota]");
     const historyList = $("[data-history-list]");
     const historyCount = $("[data-history-count]");
     const historyStats = $("[data-history-stats]");
@@ -3012,6 +3496,10 @@
       lookupStatus.dataset.error = lookupStatusError.toString();
     };
     renderLookupStatus = updateLookupStatus;
+    const updateLookupQuota = () => {
+      lookupQuotaLabel.textContent = describeLookupQuota();
+    };
+    renderLookupQuota = updateLookupQuota;
     const renderQueue = () => {
       queueCount.textContent = lookupRecords.size ? `(${lookupRecords.size.toLocaleString()})` : "";
       queueStats.textContent = `${lookupRecords.size.toLocaleString()} queued ${lookupRecords.size === 1 ? "account" : "accounts"}`;
@@ -3165,6 +3653,8 @@
       hideToggle.checked = hideEnabled;
       blockToggle.checked = blockEnabled;
       notificationsToggle.checked = notificationsEnabled;
+      notificationSizeSelect.value = notificationSize;
+      notificationPositionSelect.value = notificationPosition;
       const counts = [
         blockSuccessCount ? `${blockSuccessCount.toLocaleString()} blocked this page` : "",
         `${totalBlockedCount.toLocaleString()} total blocked`,
@@ -3403,6 +3893,24 @@
       writeStorage("localefence.notificationsEnabled", notificationsEnabled);
       if (!notificationsEnabled) document.querySelector("[data-localefence-toasts]")?.remove();
     });
+    notificationSizeSelect.addEventListener("change", () => {
+      notificationSize = notificationSizes.has(notificationSizeSelect.value)
+        ? notificationSizeSelect.value
+        : "compact";
+      notificationSizeSelect.value = notificationSize;
+      writeStorage("localefence.notificationSize", notificationSize);
+      const toastHost = document.querySelector("[data-localefence-toasts]");
+      if (toastHost) toastHost.dataset.size = notificationSize;
+    });
+    notificationPositionSelect.addEventListener("change", () => {
+      notificationPosition = notificationPositions.has(notificationPositionSelect.value)
+        ? notificationPositionSelect.value
+        : "top-right";
+      notificationPositionSelect.value = notificationPosition;
+      writeStorage("localefence.notificationPosition", notificationPosition);
+      const toastHost = document.querySelector("[data-localefence-toasts]");
+      if (toastHost) toastHost.dataset.position = notificationPosition;
+    });
     blockToggle.addEventListener("change", () => {
       if (blockToggle.checked) {
         if (!selectedLocations.size) {
@@ -3448,7 +3956,7 @@
       }
       if (event.key !== "Tab") return;
       const focusable = [...wrapper.querySelectorAll(
-        '[data-localefence-menu] button:not([disabled]), [data-localefence-menu] input:not([disabled]), [data-localefence-menu] a[href]',
+        '[data-localefence-menu] button:not([disabled]), [data-localefence-menu] input:not([disabled]), [data-localefence-menu] select:not([disabled]), [data-localefence-menu] a[href]',
       )].filter((element) => !element.closest("[hidden]") && getComputedStyle(element).display !== "none");
       if (!focusable.length) return;
       const first = focusable[0];
@@ -3461,13 +3969,14 @@
         first.focus();
       }
     });
-    if (mountNav) mountNav.insertBefore(wrapper, mountNav.lastElementChild);
+    if (mountNav) placeLocaleFenceInNav(wrapper, mountNav);
     else mount.appendChild(wrapper);
     renderHistory();
     renderQueue();
     setActiveView("countries");
     updateActionControls();
     updateLookupStatus();
+    updateLookupQuota();
   };
 
   let mountFailureReported = false;
@@ -3513,7 +4022,7 @@
     findTweets(document);
     syncLookupBackoffUntil();
     if (lookupBackoffUntil) setLookupStatus(describeLookupBackoff());
-    else if (lookupStatusMessage.startsWith("X paused location lookups")) setLookupStatus();
+    else if (lookupStatusMessage.startsWith("Location lookups are rate-limited.")) setLookupStatus();
     if (queue.length) scheduleQueue(Math.max(lookupBackoffUntil - Date.now(), 0));
   };
   if (document.readyState === "complete") resumeVisibleWork();

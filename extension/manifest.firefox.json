@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "LocaleFence - Country Filter for X",
   "short_name": "LocaleFence",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "description": "See X account countries, hide matching posts, and optionally block matching accounts - all locally.",
   "icons": {
     "16": "extension/icons/icon-16.png",

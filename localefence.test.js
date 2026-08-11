@@ -13,17 +13,25 @@ const instrumentedSource = source.replace(
     getBlockEnabled: () => blockEnabled,
     getBlockPaused: () => blockPaused,
     getBlockQueue: () => blockQueue.map(({ restId, username }) => ({ restId, username })),
+    getCachedAccount,
     getAboutQueryId: () => aboutQueryId,
     getLookupBackoffUntil: () => lookupBackoffUntil,
     getLookupRecord: (username) => lookupRecords.get(usernameKey(username)),
+    getLookupQuota: () => lookupQuota,
+    getNotificationPosition: () => notificationPosition,
+    getNotificationSize: () => notificationSize,
     getRuntimeVersion: () => runtimeVersion,
     getSelectedLocations: () => [...selectedLocations],
     applyPostVisibility,
     enqueueBlock,
     fetchCountry,
     isKnownBlocked,
+    isCompactLocaleFenceNav,
+    isUnavailableAccount,
     pauseBlocking,
+    placeLocaleFenceInNav,
     rememberLookupRecord,
+    rememberUnavailableAccount,
     removeLookupRecord,
     resetLocaleFenceData,
     resolveLocaleFenceMount,
@@ -206,8 +214,8 @@ const testAndroidMountRecovery = () => {
     runtimeDataset: { localefenceRuntime: "1.2.1" },
     storedBlockEnabled: "false",
   });
-  assert.equal(app.runtime(), "1.2.3", "a stale mobile-tab marker must not prevent reinjection");
-  assert.equal(app.hooks.getRuntimeVersion(), "1.2.3");
+  assert.equal(app.runtime(), "1.2.4", "a stale mobile-tab marker must not prevent reinjection");
+  assert.equal(app.hooks.getRuntimeVersion(), "1.2.4");
   const body = {};
   assert.equal(
     app.hooks.resolveLocaleFenceMount({
@@ -241,6 +249,182 @@ const testAndroidMountRecovery = () => {
     body,
     "the mount watchdog must recover even when Firefox requests the desktop site",
   );
+  const nav = {};
+  const compactMount = app.hooks.resolveLocaleFenceMount({
+    allowStandalone: true,
+    androidBrowser: true,
+    body,
+    compactViewport: true,
+    nav,
+  });
+  assert.equal(compactMount.mount, nav, "X's navigation must win over the floating fallback on Android");
+  assert.equal(compactMount.mountNav, nav);
+  assert.equal(
+    app.hooks.isCompactLocaleFenceNav({ getBoundingClientRect: () => ({ width: 88 }) }),
+    true,
+    "X's measured compact navigation must hide LocaleFence's text label",
+  );
+  assert.equal(
+    app.hooks.isCompactLocaleFenceNav({ getBoundingClientRect: () => ({ width: 240 }) }),
+    false,
+    "X's measured wide navigation must retain LocaleFence's text label",
+  );
+  const insertionPoint = {};
+  const floatingRoot = { dataset: { localefenceStandalone: "true" }, parentNode: body };
+  const mountedNav = {
+    getBoundingClientRect: () => ({ width: 88 }),
+    lastElementChild: insertionPoint,
+    insertBefore(node, reference) {
+      assert.equal(reference, insertionPoint);
+      node.parentNode = this;
+    },
+  };
+  app.hooks.placeLocaleFenceInNav(floatingRoot, mountedNav);
+  assert.equal(floatingRoot.parentNode, mountedNav, "a mounted fallback must move into X's late navigation");
+  assert.equal(floatingRoot.dataset.localefenceStandalone, "false");
+  assert.equal(floatingRoot.dataset.localefenceCompact, "true");
+};
+
+const testNotificationPreferences = () => {
+  const defaults = boot({
+    currentOwner: "1",
+    storedBlockEnabled: "false",
+  });
+  assert.equal(defaults.hooks.getNotificationSize(), "compact");
+  assert.equal(defaults.hooks.getNotificationPosition(), "top-right");
+  const selected = boot({
+    currentOwner: "1",
+    storageValues: new Map([
+      ["localefence.notificationSize", "standard"],
+      ["localefence.notificationPosition", "bottom-right"],
+    ]),
+    storedBlockEnabled: "false",
+  });
+  assert.equal(selected.hooks.getNotificationSize(), "standard");
+  assert.equal(selected.hooks.getNotificationPosition(), "bottom-right");
+  const invalid = boot({
+    currentOwner: "1",
+    storageValues: new Map([
+      ["localefence.notificationSize", "huge"],
+      ["localefence.notificationPosition", "center"],
+    ]),
+    storedBlockEnabled: "false",
+  });
+  assert.equal(invalid.hooks.getNotificationSize(), "compact");
+  assert.equal(invalid.hooks.getNotificationPosition(), "top-right");
+};
+
+const testUiInteractionStyles = () => {
+  for (const position of ["top-left", "top-right", "bottom-left", "bottom-right"]) {
+    assert.ok(
+      source.includes(`<option value="${position}">`),
+      `the notification position setting must include ${position}`,
+    );
+  }
+  assert.match(
+    source,
+    /\[data-localefence-trigger\]::before\s*\{[\s\S]*?background: currentColor;[\s\S]*?transition: opacity 0\.2s ease;/,
+    "the sidebar trigger must use an animated hover layer that is independent of its fallback background",
+  );
+  assert.match(
+    source,
+    /\[data-localefence-trigger\]:hover::before,[\s\S]*?opacity: 0\.1;/,
+    "the sidebar trigger hover layer must activate before the menu has been opened",
+  );
+  assert.match(
+    source,
+    /\[data-localefence-tabs\] button:hover,[\s\S]*?background: var\(--lf-hover\);/,
+    "menu tabs must expose hover feedback",
+  );
+  assert.match(
+    source,
+    /\[data-localefence-trigger\] > svg\s*\{[\s\S]*?transform: scale\(1\.25\);/,
+    "the LocaleFence glyph must fill the same visual box as X's native navigation icons",
+  );
+  assert.match(
+    source,
+    /\[data-localefence-label\]\s*\{[\s\S]*?margin-right: 16px;/,
+    "the navigation label must retain X's native trailing space inside the hover pill",
+  );
+  assert.match(
+    source,
+    /--lf-toast-top-right-offset: 72px;[\s\S]*?\[data-localefence-toasts\]\[data-position="top-right"\][\s\S]*?top: var\(--lf-toast-top-right-offset\);/,
+    "desktop top-right notifications must clear X's search bar",
+  );
+};
+
+const testSharedLookupCacheAvoidsCrossTabRequest = async () => {
+  const sharedStorage = new Map();
+  let requests = 0;
+  const firstTab = boot({
+    currentOwner: "1",
+    fetchImpl: async () => {
+      requests += 1;
+      return {
+        headers: { get: () => null },
+        json: () => Promise.resolve({
+          data: {
+            user_result_by_screen_name: {
+              result: {
+                rest_id: "2",
+                core: { name: "Alice", screen_name: "Alice" },
+                about_profile: { account_based_in: "France" },
+              },
+            },
+          },
+        }),
+        ok: true,
+        status: 200,
+      };
+    },
+    storageValues: sharedStorage,
+    storedBlockEnabled: "false",
+  });
+  assert.equal((await firstTab.hooks.fetchCountry("Alice")).found, true);
+  assert.equal(requests, 1);
+
+  const secondTab = boot({
+    currentOwner: "1",
+    fetchImpl: async () => {
+      requests += 1;
+      throw new Error("the second tab must reuse the shared lookup");
+    },
+    storageValues: sharedStorage,
+    storedBlockEnabled: "false",
+  });
+  assert.equal(secondTab.hooks.getCachedAccount("Alice").country, "France");
+  secondTab.hooks.enqueue(
+    "Alice",
+    { appendChild() {}, querySelector() { return null; } },
+    { closest() { return null; }, isConnected: true, querySelector() { return null; } },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(requests, 1, "a cached result from another tab must not consume another X lookup");
+};
+
+const testUnavailableAccountCacheAvoidsRepeatedRequest = async () => {
+  const sharedStorage = new Map();
+  const firstTab = boot({ currentOwner: "1", storageValues: sharedStorage, storedBlockEnabled: "false" });
+  firstTab.hooks.rememberUnavailableAccount("MissingUser", "User not found");
+  let requests = 0;
+  const secondTab = boot({
+    currentOwner: "1",
+    fetchImpl: async () => {
+      requests += 1;
+      throw new Error("a recently unavailable account must not be requested again");
+    },
+    storageValues: sharedStorage,
+    storedBlockEnabled: "false",
+  });
+  assert.equal(secondTab.hooks.isUnavailableAccount("MissingUser"), true);
+  secondTab.hooks.enqueue(
+    "MissingUser",
+    { appendChild() {}, querySelector() { return null; } },
+    { closest() { return null; }, isConnected: true, querySelector() { return null; } },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(requests, 0);
+  assert.equal(secondTab.hooks.getLookupRecord("MissingUser"), undefined);
 };
 
 const testFreshIdentityAndDurableDeduplication = async () => {
@@ -442,6 +626,7 @@ const testTerminalLookupFailuresDoNotRetry = async () => {
   });
   const graphQlFailure = await graphQlFailureApp.hooks.fetchCountry("MissingUser");
   assert.equal(graphQlFailure.retryable, false);
+  assert.equal(graphQlFailure.unavailable, true);
   assert.equal(graphQlRequests, 1);
 };
 
@@ -451,6 +636,7 @@ const testRateLimitBackoffPersistence = async () => {
   const fetchImpl = async () => ({
     headers: {
       get(name) {
+        if (name === "x-rate-limit-limit") return "100";
         if (name === "x-rate-limit-remaining") return "0";
         if (name === "x-rate-limit-reset") return String(resetAt);
         return null;
@@ -464,6 +650,9 @@ const testRateLimitBackoffPersistence = async () => {
   assert.equal(result.status, 429);
   assert.equal(result.retryable, true);
   assert.ok(result.retryAfterMs > 115000 && result.retryAfterMs <= 121000);
+  assert.equal(app.hooks.getLookupQuota().remaining, 0);
+  assert.equal(app.hooks.getLookupQuota().limit, 100);
+  assert.ok(app.hooks.getLookupQuota().resetAt > Date.now() + 115000);
 
   app.hooks.rememberLookupRecord("Alice", {
     tweetText: "Rate-limited post",
@@ -480,6 +669,58 @@ const testRateLimitBackoffPersistence = async () => {
     reloaded.hooks.getLookupBackoffUntil(),
     app.hooks.getLookupBackoffUntil(),
     "the shared X quota pause must survive reloads",
+  );
+};
+
+const testHeaderlessRateLimitUsesFallbackEstimate = async () => {
+  const storageValues = new Map();
+  const app = boot({
+    currentOwner: "1",
+    fetchImpl: async () => ({ headers: { get: () => null }, ok: false, status: 429 }),
+    storageValues,
+    storedBlockEnabled: "false",
+  });
+  const result = await app.hooks.fetchCountry("Alice");
+  assert.equal(result.retryAfterMs, 0, "missing X timing headers must remain distinguishable");
+  app.hooks.rememberLookupRecord("Alice", {});
+  const before = Date.now();
+  assert.equal(app.hooks.scheduleLookupRetry("Alice", result), true);
+  const fallbackDelay = app.hooks.getLookupBackoffUntil() - before;
+  assert.ok(
+    fallbackDelay >= 14900 && fallbackDelay <= 15100,
+    "a headerless HTTP 429 must use the conservative 15-second estimate",
+  );
+  const secondBefore = Date.now();
+  assert.equal(app.hooks.scheduleLookupRetry("Alice", result), true);
+  const secondFallbackDelay = app.hooks.getLookupBackoffUntil() - secondBefore;
+  assert.ok(
+    secondFallbackDelay >= 29900 && secondFallbackDelay <= 30100,
+    "repeated headerless limits must back off exponentially instead of polling every 15 seconds",
+  );
+  const otherTab = boot({ currentOwner: "1", storageValues, storedBlockEnabled: "false" });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  otherTab.hooks.rememberLookupRecord("Bob", {});
+  const crossTabBefore = Date.now();
+  assert.equal(otherTab.hooks.scheduleLookupRetry("Bob", result), true);
+  const crossTabDelay = otherTab.hooks.getLookupBackoffUntil() - crossTabBefore;
+  assert.ok(
+    crossTabDelay >= 59900 && crossTabDelay <= 60100,
+    "headerless fallback escalation must persist across X tabs and reloads",
+  );
+};
+
+const testMultiDayServerBackoffIsHonored = async () => {
+  const app = boot({ currentOwner: "1", storedBlockEnabled: "false" });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  app.hooks.rememberLookupRecord("Alice", {});
+  const before = Date.now();
+  assert.equal(app.hooks.scheduleLookupRetry("Alice", {
+    retryAfterMs: 2 * 24 * 60 * 60 * 1000,
+    status: 429,
+  }), true);
+  assert.ok(
+    app.hooks.getLookupBackoffUntil() - before > 47 * 60 * 60 * 1000,
+    "a multi-day reset reported by X must not be shortened to one day",
   );
 };
 
@@ -720,10 +961,16 @@ const testCompleteReset = async () => {
 
 const run = async () => {
   testAndroidMountRecovery();
+  testNotificationPreferences();
+  testUiInteractionStyles();
+  await testSharedLookupCacheAvoidsCrossTabRequest();
+  await testUnavailableAccountCacheAvoidsRepeatedRequest();
   await testQueryIdRecovery();
   await testPostTransportFallback();
   await testTerminalLookupFailuresDoNotRetry();
   await testRateLimitBackoffPersistence();
+  await testHeaderlessRateLimitUsesFallbackEstimate();
+  await testMultiDayServerBackoffIsHonored();
   await testNonRateLimitErrorIgnoresQuotaReset();
   await testImmediateNormalLookups();
   await testFreshIdentityAndDurableDeduplication();

@@ -1,6 +1,6 @@
 # LocaleFence privacy policy
 
-Last updated: August 8, 2026
+Last updated: August 11, 2026
 
 LocaleFence is a local-first browser tool for `x.com`. It does not operate a developer-controlled server, include analytics or advertising, or sell or share user data.
 
@@ -10,8 +10,9 @@ To provide its visible features, LocaleFence reads X usernames and visible post 
 
 LocaleFence stores the following only in browser storage associated with `x.com`:
 
-- selected locations, preferences, exclusions, counters, and remembered block identifiers;
+- selected locations, preferences, exclusions, counters, remembered block identifiers, and X's last reported lookup-quota headers;
 - resolved X account IDs, display names, usernames, countries, and cache timestamps;
+- a bounded copy of the 64 most recent lookup results for coordination across open X tabs, plus one-hour unavailable-profile markers that prevent repeated failed requests;
 - pending lookup items and up to 250 automatic-block history entries, including a short snapshot and URL of the post that triggered each action.
 
 This information is used only to show account-location context, apply the filters you select, avoid duplicate actions, and let you review or undo automatic blocks. LocaleFence does not read direct messages.

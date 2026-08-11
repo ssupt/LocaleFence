@@ -18,11 +18,11 @@ It is local-first: there is no LocaleFence server, analytics, or external data s
 - Select individual countries, X regions, or whole continents.
 - Hide matching posts without blocking their authors.
 - Optionally block matching accounts as their posts appear.
-- Show the account, flag, and triggering post in each block notification.
+- Show the account, flag, and triggering post in corner-positioned block notifications, compact by default and placed below X's search bar.
 - Exclude and immediately unblock an account from its notification or block-history entry.
 - Keep lookups that cannot proceed in a persistent, inspectable queue with rate-limit backoff.
 - Keep up to 250 confirmed block-history entries and their triggering post snapshots locally.
-- Cache successful location lookups for 28 days to reduce requests and rate limits.
+- Cache successful location lookups for 28 days, share the 64 most recent results across open X tabs, and briefly remember unavailable profiles to avoid wasted requests.
 - Recover from X `AboutAccountQuery` identifier changes using observed same-origin requests and a current fallback.
 - Revalidate the current username, account ID, and location immediately before every automatic block.
 - Serialize block requests across open X tabs and remember confirmed blocks per signed-in X account.
@@ -34,7 +34,7 @@ It is local-first: there is no LocaleFence server, analytics, or external data s
 2. Open **[LocaleFence on Greasy Fork](https://greasyfork.org/en/scripts/585483-localefence-for-x)** and confirm the installation.
 3. Open or reload [x.com](https://x.com/).
 
-LocaleFence adds an item to X's navigation. On narrow screens it uses a floating filter button and a full-screen responsive panel.
+LocaleFence adds an item to X's navigation, including the compact left sidebar used by X on Android. If X has not built its navigation yet, LocaleFence uses a temporary floating fallback and automatically moves it into the sidebar when the navigation appears. The settings panel is full-screen on narrow displays.
 
 The userscript keeps its original metadata name, **LocaleFence for X**, so existing Greasy Fork installations continue to be recognized as the same script. The browser-extension title is **LocaleFence - Country Filter for X**.
 
@@ -81,7 +81,7 @@ Do not run both distributions at once. LocaleFence detects this situation and al
 
    Use `org.mozilla.firefox_beta` for Firefox Beta or `org.mozilla.fenix` for Firefox Nightly.
 
-6. In Firefox on the phone, sign in at `x.com`, reload the page, and open the floating LocaleFence filter button. Test flags and hiding before enabling automatic blocking.
+6. In Firefox on the phone, sign in at `x.com`, reload the page, and open LocaleFence from X's navigation. Test flags and hiding before enabling automatic blocking.
 7. Keep the terminal command running during the test. Press **Ctrl+C** when finished; this is a temporary development installation.
 
 For debugging, connect Firefox Desktop through `about:debugging`, select the Android device, and inspect its main process or the `x.com` tab.
@@ -92,13 +92,13 @@ For debugging, connect Firefox Desktop through `about:debugging`, select the And
 2. Enable **Hide matching posts**, **Automatically block accounts**, or both.
 3. Use **Lookup queue** to inspect unresolved or failed checks. Removing an item cancels its block if the request has not started.
 4. Use **Block history** to review confirmed actions and open their triggering posts.
-5. Use **Settings** to manage notifications or erase all LocaleFence data.
+5. Use **Settings** to enable notifications, choose their size and screen corner, inspect X's last reported lookup quota, or erase all LocaleFence data.
 
 Automatic blocking remains enabled across X reloads until you turn it off. If a block request fails or times out, LocaleFence keeps the safety pause across reloads; turn blocking off and on only when you deliberately want to retry. Adding a location while blocking is active also requires confirmation because matching accounts already in the feed may be processed immediately.
 
 Selecting a continent includes all of its member countries. Individual countries can be selected independently. Continent membership follows the [UN M49 geographic classification](https://unstats.un.org/unsd/methodology/m49/overview/).
 
-Under normal quota, location checks and confirmed block actions proceed immediately without a fixed or adaptive pacing delay. Location checks use the same read-only POST transport as LocaleFence 1.1.0, with GET retained as a compatibility fallback only if X rejects POST. Terminal profile and GraphQL errors are not retried repeatedly. When X actually rate-limits a lookup, LocaleFence retains the account and post snapshot, honors X's quota-reset headers, and persists one shared cooldown across reloads and open X tabs. Lookups resume only while X is visible. A non-matching account leaves the queue after resolution. A matching account remains until X confirms the block, then moves to block history.
+Under normal quota, location checks and confirmed block actions proceed immediately without a fixed or adaptive pacing delay. Location checks use the same read-only POST transport as LocaleFence 1.1.0, with GET retained as a compatibility fallback only if X rejects POST. Terminal unavailable-profile results are remembered for one hour instead of being requested repeatedly, and a waiting tab reuses another tab's newly completed lookup when doing so does not weaken block identity verification. When X actually rate-limits a lookup, LocaleFence retains the account and post snapshot, honors X's `Retry-After` and quota-reset headers for up to seven days, and persists one shared cooldown across reloads and open X tabs. A server-provided reset is used as the scheduled retry time with a one-second safety margin; if X omits both headers, LocaleFence starts with a 15-second estimate and doubles repeated headerless waits up to one hour instead of polling X continuously. Lookups resume only while X is visible. A non-matching account leaves the queue after resolution. A matching account remains until X confirms the block, then moves to block history.
 
 Cached location data may be used to hide posts. It is never trusted as username-to-account proof for blocking: LocaleFence performs a fresh identity lookup immediately before the request.
 
@@ -113,7 +113,7 @@ LocaleFence reads only the X page content needed for its visible features and se
 
 It stores the following in browser storage associated with `x.com`:
 
-- selected locations, settings, exclusions, counters, pause state, and remembered owner/account block IDs in `localStorage`;
+- selected locations, settings, exclusions, counters, pause state, remembered owner/account block IDs, quota telemetry, and a small cross-tab lookup cache in `localStorage`;
 - resolved account IDs, names, locations, and cache timestamps in IndexedDB;
 - pending lookup records and up to 250 confirmed block-history entries in IndexedDB.
 
@@ -124,6 +124,7 @@ See the full [privacy policy](PRIVACY.md).
 ## Limitations
 
 - X account locations may be missing, broad, stale, or inaccurate.
+- Each previously unseen account requires an X About Account request. X does not publish the private endpoint's exact allowance, so long sessions can exhaust it even though LocaleFence caches and deduplicates results; queued checks resume after X's reported reset.
 - X's private web APIs can change without notice. LocaleFence can recover from query-identifier rotation, but schema or action-endpoint changes can still break features temporarily.
 - A timed-out action has an unknown server result, so automatic blocking pauses for review.
 - Excluding an account requires a successful X unblock request to undo an existing block.
