@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LocaleFence for X
 // @namespace    https://github.com/ssupt/LocaleFence
-// @version      1.2.4
+// @version      1.2.5
 // @description  See X account countries, hide matching posts, and optionally block matching accounts
 // @author       ssupt
 // @license      GPL-3.0-only
@@ -24,7 +24,7 @@
   // running when someone has installed both distributions. A synchronous
   // ping distinguishes a live runtime from a stale marker restored by a
   // discarded mobile tab.
-  const runtimeVersion = "1.2.4";
+  const runtimeVersion = "1.2.5";
   const runtimePingEvent = "localefence:runtime-ping";
   const runtimeRoot = document.documentElement;
   const pingExistingRuntime = () => {
@@ -44,7 +44,7 @@
     const claimedAt = Number(runtimeRoot.dataset.localefenceRuntimeClaimedAt);
     if (Number.isFinite(claimedAt) && Date.now() - claimedAt < 2000) return;
     document.querySelectorAll?.(
-      "[data-localefence-root], [data-localefence-toasts], [data-localefence-styles]",
+      "[data-localefence-root], [data-localefence-overlay], [data-localefence-toasts], [data-localefence-styles]",
     ).forEach((node) => node.remove());
   }
   if (runtimeRoot?.dataset) {
@@ -729,6 +729,9 @@
     const root = document.body || document.documentElement;
     if (!root) return;
     targetUrl = normalizeTweetUrl(targetUrl);
+    // Small screens get a minimal pill (flag + short text, ~1s, no stacking)
+    // tucked under the app header instead of feed-covering cards.
+    const miniToast = Boolean(globalThis.matchMedia?.("(max-width: 700px)")?.matches);
     let host = document.querySelector("[data-localefence-toasts]");
     if (!host) {
       host = document.createElement("div");
@@ -737,9 +740,11 @@
     }
     host.dataset.theme = getPageTheme();
     host.dataset.size = notificationSize;
-    host.dataset.position = notificationPosition;
+    host.dataset.position = miniToast ? "top-right" : notificationPosition;
+    if (miniToast) host.replaceChildren();
     const toast = document.createElement("div");
     toast.dataset.localefenceToast = "true";
+    if (miniToast) toast.dataset.localefenceMini = "true";
     toast.dataset.error = error.toString();
     toast.dataset.interactive = Boolean((actionLabel && onAction) || targetUrl).toString();
     toast.dataset.clickable = Boolean(targetUrl).toString();
@@ -749,9 +754,9 @@
     icon.textContent = error ? "!" : "✓";
     const body = document.createElement("span");
     body.dataset.toastBody = "true";
-    const copy = document.createElement(targetUrl ? "a" : "span");
+    const copy = document.createElement(targetUrl && !miniToast ? "a" : "span");
     copy.dataset.toastCopy = "true";
-    if (targetUrl) {
+    if (targetUrl && !miniToast) {
       copy.href = targetUrl;
       copy.target = "_blank";
       copy.rel = "noopener noreferrer";
@@ -772,19 +777,19 @@
     title.textContent = message;
     titleRow.appendChild(title);
     copy.appendChild(titleRow);
-    if (postText) {
+    if (postText && !miniToast) {
       const post = document.createElement("span");
       post.dataset.toastPost = "true";
       post.textContent = postText;
       copy.appendChild(post);
     }
-    if (targetUrl) {
+    if (targetUrl && !miniToast) {
       const hint = document.createElement("span");
       hint.dataset.toastHint = "true";
       hint.textContent = "Click to view post";
       copy.appendChild(hint);
     }
-    if (actionLabel && onAction) {
+    if (actionLabel && onAction && !miniToast) {
       const action = document.createElement("button");
       action.dataset.toastAction = "true";
       action.type = "button";
@@ -802,7 +807,8 @@
       });
       body.appendChild(action);
     }
-    toast.append(icon, body);
+    if (miniToast) toast.append(body);
+    else toast.append(icon, body);
     host.appendChild(toast);
     requestAnimationFrame(() => {
       toast.dataset.visible = "true";
@@ -810,7 +816,7 @@
     const removalTimer = setTimeout(() => {
       toast.dataset.visible = "false";
       setTimeout(() => toast.remove(), 200);
-    }, actionLabel ? 12000 : postText ? 5200 : 3200);
+    }, miniToast ? 1200 : actionLabel ? 12000 : postText ? 5200 : 3200);
   };
   const compact = (object) =>
     Object.fromEntries(Object.entries(object).filter(([, value]) => value !== undefined && value !== ""));
@@ -2328,8 +2334,11 @@
   };
 
   const findTweets = (root) => {
+    // Text nodes have no query API: accessing .forEach on the short-circuited
+    // lookup would throw and abort the whole observer batch.
+    if (root && root.nodeType !== 1 && root.nodeType !== 9 && root.nodeType !== 11) return;
     if (root?.matches?.('[data-testid="tweet"]')) handleTweet(root);
-    root?.querySelectorAll?.('[data-testid="tweet"]').forEach(handleTweet);
+    root?.querySelectorAll?.('[data-testid="tweet"]')?.forEach?.(handleTweet);
   };
 
   // Navigation and settings UI
@@ -2344,6 +2353,7 @@
     style.dataset.localefenceStyles = "true";
     style.textContent = `
       [data-localefence-root],
+      [data-localefence-overlay],
       [data-localefence-toasts] {
         --lf-background: #000;
         --lf-surface: #16181c;
@@ -2358,6 +2368,7 @@
         --lf-shadow: rgba(255, 255, 255, 0.06);
       }
       [data-localefence-root][data-theme="light"],
+      [data-localefence-overlay][data-theme="light"],
       [data-localefence-toasts][data-theme="light"] {
         --lf-background: #fff;
         --lf-surface: #f7f9f9;
@@ -2381,23 +2392,6 @@
         z-index: 0;
         font-family: TwitterChirp, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
       }
-      [data-localefence-root][data-localefence-standalone="true"] {
-        position: fixed;
-        right: 20px;
-        bottom: 20px;
-        z-index: 9999;
-        width: auto;
-      }
-      [data-localefence-root][data-localefence-standalone="true"] [data-localefence-trigger] {
-        gap: 0;
-        padding: 12px;
-        border: 1px solid var(--lf-border);
-        background: var(--lf-surface);
-        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
-      }
-      [data-localefence-root][data-localefence-standalone="true"] [data-localefence-label] {
-        display: none;
-      }
       [data-localefence-trigger] {
         display: flex;
         align-items: center;
@@ -2415,6 +2409,8 @@
         background: transparent;
         border-radius: 9999px;
         cursor: pointer;
+        touch-action: manipulation;
+        -webkit-tap-highlight-color: transparent;
       }
       [data-localefence-trigger]::before {
         content: "";
@@ -2494,6 +2490,7 @@
         background: rgba(91, 112, 131, 0.4);
         z-index: 10000;
         display: none;
+        touch-action: none;
       }
       [data-localefence-menu] {
         position: fixed;
@@ -2502,6 +2499,9 @@
         transform: translate(-50%, -50%);
         width: min(600px, calc(100vw - 32px));
         height: 90vh;
+        height: 90dvh;
+        max-height: 90vh;
+        max-height: 90dvh;
         display: none;
         flex-direction: column;
         background: var(--lf-background);
@@ -2513,10 +2513,13 @@
         overflow: hidden;
         font-size: 15px;
       }
-      [data-localefence-root][data-localefence-open="true"] [data-localefence-backdrop] {
+      [data-localefence-overlay] {
+        font-family: TwitterChirp, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      }
+      [data-localefence-overlay][data-localefence-open="true"] [data-localefence-backdrop] {
         display: block;
       }
-      [data-localefence-root][data-localefence-open="true"] [data-localefence-menu] {
+      [data-localefence-overlay][data-localefence-open="true"] [data-localefence-menu] {
         display: flex;
       }
       [data-localefence-menu] *,
@@ -3231,19 +3234,32 @@
       [data-localefence-toast][data-error="true"] [data-toast-icon] {
         background: #f4212e;
       }
-      @media (max-width: 600px) {
-        [data-localefence-root][data-localefence-standalone="true"] {
-          right: 16px;
-          bottom: calc(84px + env(safe-area-inset-bottom));
+      @media (max-width: 700px) {
+        [data-localefence-root] {
+          width: auto;
+          max-width: 100vw;
+          flex: 0 0 auto;
+        }
+        [data-localefence-trigger] {
+          min-width: 44px;
+          min-height: 44px;
+          padding: 10px;
         }
         [data-localefence-menu] {
           inset: 0;
+          top: 0;
+          left: 0;
           transform: none;
           width: 100vw;
+          max-width: 100vw;
           height: 100vh;
           height: 100dvh;
+          max-height: 100vh;
+          max-height: 100dvh;
+          margin: 0;
           border-width: 0;
           border-radius: 0;
+          overscroll-behavior: contain;
         }
         [data-localefence-header] {
           padding-top: calc(14px + env(safe-area-inset-top));
@@ -3270,52 +3286,290 @@
         [data-localefence-toasts] {
           --lf-toast-inline-offset: 16px;
           --lf-toast-top-offset: calc(16px + env(safe-area-inset-top));
-          --lf-toast-top-right-offset: calc(16px + env(safe-area-inset-top));
+          --lf-toast-top-right-offset: calc(60px + env(safe-area-inset-top));
           --lf-toast-bottom-offset: calc(16px + env(safe-area-inset-bottom));
+        }
+        [data-localefence-toasts] [data-localefence-toast][data-localefence-mini="true"] {
+          align-items: center;
+          gap: 6px;
+          max-width: calc(100vw - 32px);
+          padding: 6px 12px;
+          overflow: hidden;
+          border-radius: 9999px;
+          font-size: 12px;
+          line-height: 16px;
+        }
+        [data-localefence-toasts] [data-localefence-toast][data-localefence-mini="true"] [data-toast-post],
+        [data-localefence-toasts] [data-localefence-toast][data-localefence-mini="true"] [data-toast-hint] {
+          display: none;
+        }
+        [data-localefence-toasts] [data-localefence-toast][data-localefence-mini="true"] [data-toast-body],
+        [data-localefence-toasts] [data-localefence-toast][data-localefence-mini="true"] [data-toast-copy] {
+          overflow: hidden;
+        }
+        [data-localefence-toasts] [data-localefence-toast][data-localefence-mini="true"] [data-toast-title] {
+          gap: 5px;
+          white-space: nowrap;
+        }
+        [data-localefence-toasts] [data-localefence-toast][data-localefence-mini="true"] [data-toast-title] > span:last-child {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        [data-localefence-toasts] [data-localefence-toast][data-localefence-mini="true"] [data-toast-flag] {
+          font-size: 14px;
         }
       }
     `;
     styleRoot.appendChild(style);
   };
 
+  const isMobileLocaleFenceViewport = () =>
+    Boolean(globalThis.matchMedia?.("(max-width: 700px)")?.matches);
+  const isHorizontalLocaleFenceNav = (nav) => {
+    try {
+      const rect = nav?.getBoundingClientRect?.();
+      const width = Number(rect?.width ?? nav?.clientWidth);
+      const height = Number(rect?.height ?? nav?.clientHeight);
+      if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return false;
+      // X's mobile web app uses a short, full-width bottom tab bar, while the
+      // desktop sidebar is tall and narrow. A horizontal nav can never host a
+      // desktop-style sidebar entry without breaking the tab layout.
+      return width > height * 1.5;
+    } catch {
+      return false;
+    }
+  };
+  // A horizontal bottom tab bar cannot host a sidebar-style entry, so mobile
+  // layouts are served through the side drawer instead.
+  const shouldUseDrawerLocaleFence = (nav) => isHorizontalLocaleFenceNav(nav);
   const resolveLocaleFenceMount = ({ allowStandalone, androidBrowser, body, compactViewport, nav }) => {
-    const mountNav = nav;
+    // The sidebar trigger lives in X's navigation on desktop layouts, while
+    // mobile layouts (horizontal bottom tab bar) use a side-drawer entry. The
+    // body mount only hosts the invisible dialog overlay, never a button.
+    const mountNav = nav || null;
     const mount = mountNav || ((androidBrowser || compactViewport || allowStandalone || nav) ? body : null);
     return { mount, mountNav };
   };
   const isCompactLocaleFenceNav = (nav) => {
+    // A bottom tab bar reports the full viewport width (e.g. ~360px), so a
+    // width-only heuristic would wrongly show the text label inside the bar.
+    // Treat every mobile/horizontal nav as compact to keep the icon-only button.
+    if (isMobileLocaleFenceViewport() || isHorizontalLocaleFenceNav(nav)) return true;
     const measuredWidth = Number(nav?.getBoundingClientRect?.()?.width ?? nav?.clientWidth);
     if (Number.isFinite(measuredWidth) && measuredWidth > 0) return measuredWidth < 200;
     return Boolean(globalThis.matchMedia?.("(max-width: 1276px)")?.matches);
   };
   const syncLocaleFenceNavLayout = (wrapper, nav) => {
     if (!wrapper || !nav) return;
-    wrapper.dataset.localefenceCompact = isCompactLocaleFenceNav(nav).toString();
+    // Only touch the DOM when the value actually changes: every attribute
+    // write invalidates style and can retrigger X's own observers, which
+    // turns a window resize into a feedback loop.
+    const compact = isCompactLocaleFenceNav(nav).toString();
+    if (wrapper.dataset.localefenceCompact !== compact) wrapper.dataset.localefenceCompact = compact;
   };
   let localeFenceNavObserver = null;
   let observedLocaleFenceNav = null;
   let observedLocaleFenceRoot = null;
+  let localeFenceLayoutQueued = false;
   const observeLocaleFenceNavLayout = (wrapper, nav) => {
     syncLocaleFenceNavLayout(wrapper, nav);
     if (!globalThis.ResizeObserver || (wrapper === observedLocaleFenceRoot && nav === observedLocaleFenceNav)) return;
     localeFenceNavObserver?.disconnect();
     observedLocaleFenceRoot = wrapper;
     observedLocaleFenceNav = nav;
-    localeFenceNavObserver = new globalThis.ResizeObserver(() => syncLocaleFenceNavLayout(wrapper, nav));
+    // Coalesce bursts (e.g. continuous window resizing) to one sync per
+    // frame instead of measuring and writing on every notification.
+    localeFenceNavObserver = new globalThis.ResizeObserver(() => {
+      if (localeFenceLayoutQueued) return;
+      localeFenceLayoutQueued = true;
+      const run = () => {
+        localeFenceLayoutQueued = false;
+        syncLocaleFenceNavLayout(wrapper, nav);
+      };
+      if (globalThis.requestAnimationFrame) globalThis.requestAnimationFrame(run);
+      else setTimeout(run, 100);
+    });
     localeFenceNavObserver.observe(nav);
+  };
+  const findLocaleFenceTabContainer = (nav) => {
+    // X's mobile bottom bar may nest its tabs in an inner flex row instead of
+    // exposing them as direct <nav> children. Prefer the row that actually
+    // holds the tabs so the trigger becomes a real tab cell.
+    try {
+      const homeLink = nav?.querySelector?.('a[href="/home"]');
+      const container = homeLink?.parentElement;
+      if (
+        container &&
+        container !== nav &&
+        (container.querySelectorAll?.('a[href]')?.length ?? 0) >= 2
+      ) return container;
+    } catch { /* Fall through to the nav element itself. */ }
+    return nav;
   };
   const placeLocaleFenceInNav = (wrapper, nav) => {
     if (!wrapper || !nav) return;
-    wrapper.dataset.localefenceStandalone = "false";
-    observeLocaleFenceNavLayout(wrapper, nav);
-    if (wrapper.parentNode === nav) return;
-    const insertionPoint = nav.lastElementChild;
-    if (insertionPoint && insertionPoint !== wrapper) nav.insertBefore(wrapper, insertionPoint);
-    else nav.appendChild(wrapper);
+    const container = findLocaleFenceTabContainer(nav);
+    observeLocaleFenceNavLayout(wrapper, container);
+    if (wrapper.parentNode === container) return;
+    const insertionPoint = container.lastElementChild;
+    if (insertionPoint && insertionPoint !== wrapper) container.insertBefore(wrapper, insertionPoint);
+    else container.appendChild(wrapper);
+  };
+  const disconnectLocaleFenceNavObserver = () => {
+    localeFenceNavObserver?.disconnect();
+    observedLocaleFenceRoot = null;
+    observedLocaleFenceNav = null;
+  };
+  let openLocaleFenceMenu = null;
+  let wiredOpenMenu = null;
+  let triggerButtonNode = null;
+  let triggerWrapperNode = null;
+  // The dialog overlay is built, wired, and attached only when first opened:
+  // a body-level node during X's boot wedges page load (proven by A/B
+  // bisect), while sidebar/drawer triggers are safe from the start.
+  openLocaleFenceMenu = () => {
+    if (!wiredOpenMenu && !buildLocaleFenceOverlay()) return;
+    try {
+      wiredOpenMenu();
+    } catch (error) {
+      console.warn("LocaleFence could not open its settings.", error);
+    }
+  };
+  const bindLocaleFenceTrigger = (wrapperNode) => {
+    if (!wrapperNode) return;
+    const button = wrapperNode.querySelector?.("[data-localefence-trigger]");
+    if (!button || button.dataset.localefenceBound) return;
+    button.dataset.localefenceBound = "true";
+    triggerButtonNode = button;
+    triggerWrapperNode = wrapperNode;
+    button.addEventListener("click", () => {
+      try {
+        openLocaleFenceMenu?.();
+      } catch { /* Opening the dialog is best effort here. */ }
+    });
+  };
+  const findLocaleFenceDrawerAnchor = (scope = document) => {
+    // The side drawer holds locale-independent links such as /settings, so
+    // prefer href matching over visible labels. Several tiers cover X markup
+    // variations (nested settings paths, query strings, reordered rows).
+    try {
+      const exact = scope.querySelector?.('a[href="/settings"], a[href$="/settings"]');
+      if (exact) return exact;
+      const hrefIncludes = (link, text) =>
+        String(link?.getAttribute?.("href") || link?.href || "").toLowerCase().includes(text);
+      const links = [...(scope.querySelectorAll?.("a[href]") || [])];
+      const nestedSettings = links.find((link) => hrefIncludes(link, "setting"));
+      if (nestedSettings) return nestedSettings;
+      const logout = links.find((link) => hrefIncludes(link, "logout"));
+      const drawer = logout?.closest?.("div") || scope;
+      const rows = [...(drawer.querySelectorAll?.("a") || [])]
+        .filter((link) => link.querySelector?.("svg"));
+      const englishSettings = rows.find((link) => link.textContent?.trim() === "Settings and privacy");
+      if (englishSettings) return englishSettings;
+      // Last resort: the drawer row immediately above "Log out" is the
+      // settings row in every known X drawer ordering.
+      const logoutIndex = rows.indexOf(logout);
+      if (logout && logoutIndex > 0) return rows[logoutIndex - 1];
+      return null;
+    } catch {
+      return null;
+    }
+  };
+  const rowForLocaleFenceDrawerAnchor = (anchor) => {
+    // The matched link can be nested inside its row (icon and label in
+    // separate elements). Climb until the node is one icon-bearing row among
+    // sibling rows, so the entry is inserted as a full sibling row instead of
+    // inline content clipped inside the anchor's row.
+    try {
+      let node = anchor;
+      for (let depth = 0; depth < 6 && node?.parentElement; depth += 1) {
+        const parent = node.parentElement;
+        const rowLike = [...(parent.children || [])].filter((child) => child.querySelector?.("svg"));
+        if (rowLike.length >= 3) return node;
+        if (rowLike.length === 0) break;
+        node = parent;
+      }
+    } catch { /* Fall through to the anchor itself. */ }
+    return anchor;
+  };
+  const buildLocaleFenceDrawerEntry = (anchor) => {
+    // Clone the drawer row so the entry inherits X's exact row layout, icon
+    // metrics, and padding instead of approximating them with custom CSS.
+    const row = rowForLocaleFenceDrawerAnchor(anchor);
+    const entry = row.cloneNode(true);
+    entry.dataset.localefenceDrawerEntry = "true";
+    entry.removeAttribute("href");
+    entry.querySelectorAll?.("[href]").forEach?.((node) => node.removeAttribute("href"));
+    entry.setAttribute("aria-label", "LocaleFence");
+    entry.setAttribute("tabindex", "0");
+    const icon = entry.querySelector?.("svg");
+    if (icon) {
+      icon.setAttribute("viewBox", "0 0 24 24");
+      icon.setAttribute("aria-hidden", "true");
+      icon.innerHTML =
+        '<path fill-rule="evenodd" clip-rule="evenodd" d="M3.75 5.5C3.75 4.67 4.42 4 5.25 4h13.5c.83 0 1.5.67 1.5 1.5 0 .37-.14.72-.39.99l-5.11 5.63V17c0 .57-.32 1.09-.82 1.34l-3 1.5c-.47.24-1.03.21-1.47-.06-.44-.27-.71-.76-.71-1.28v-6.38L4.14 6.49c-.25-.27-.39-.62-.39-.99zM5.85 6l4.49 5.49c.27.32.41.72.41 1.13v5.07l2-1v-4.07c0-.41.14-.81.41-1.13L17.65 6H5.85z" fill="currentColor"></path>';
+    }
+    const label = [...(entry.querySelectorAll?.("span, div") || [])]
+      .find((node) => node.children.length === 0 && node.textContent?.trim().length > 2);
+    if (label) label.textContent = "LocaleFence";
+    else entry.setAttribute("aria-label", "LocaleFence");
+    entry.addEventListener("click", (event) => {
+      event.preventDefault();
+      // Let X's own drawer handlers run (the drawer closes) while opening the
+      // body-level settings dialog.
+      try {
+        openLocaleFenceMenu?.();
+      } catch { /* Opening the dialog is best effort here. */ }
+    });
+    entry.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      try {
+        openLocaleFenceMenu?.();
+      } catch { /* Opening the dialog is best effort here. */ }
+    });
+    return entry;
+  };
+  let lastLocaleFenceDrawerScanAt = 0;
+  const maybeEnsureLocaleFenceDrawerEntry = () => {
+    // Drawer scans walk the document, so cap them during DOM storms
+    // (timeline renders, window resizing) instead of scanning per mutation —
+    // and never scan at all unless a mobile layout armed the drawer.
+    if (!localeFenceDrawerArmed) return;
+    const now = Date.now();
+    if (now - lastLocaleFenceDrawerScanAt < 1500) return;
+    lastLocaleFenceDrawerScanAt = now;
+    ensureLocaleFenceDrawerEntry();
+  };
+  const ensureLocaleFenceDrawerEntry = () => {
+    if (!openLocaleFenceMenu) return;
+    try {
+      if (document.querySelector("[data-localefence-drawer-entry]")?.isConnected) return;
+      const anchor = findLocaleFenceDrawerAnchor();
+      if (!anchor || anchor.closest?.("[data-localefence-drawer-entry]")) return;
+      const entry = buildLocaleFenceDrawerEntry(anchor);
+      rowForLocaleFenceDrawerAnchor(anchor).after(entry);
+    } catch { /* Drawer injection is best effort. */ }
+  };
+  let cachedLocaleFenceNav = null;
+  let localeFenceDrawerArmed = false;
+  const findLocaleFenceNav = (root) => {
+    // The `:has()` lookup walks the whole document, so reuse the cached nav
+    // while it is still connected instead of rescanning on every mutation
+    // batch, resize tick, and visibility change.
+    if (cachedLocaleFenceNav?.isConnected) return cachedLocaleFenceNav;
+    cachedLocaleFenceNav = null;
+    let nav = null;
+    try {
+      nav = root?.closest?.('nav:has(a[href="/home"])') || root?.querySelector?.('nav:has(a[href="/home"])');
+    } catch { nav = null; }
+    if (nav) cachedLocaleFenceNav = nav;
+    return nav;
   };
   const findNav = (root, allowStandalone = false) => {
-    const nav = root?.closest?.('nav:has(a[href="/home"])') || root?.querySelector?.('nav:has(a[href="/home"])');
-    const compactViewport = globalThis.matchMedia?.("(max-width: 600px)")?.matches;
+    const nav = findLocaleFenceNav(root);
+    const compactViewport = globalThis.matchMedia?.("(max-width: 700px)")?.matches;
     const androidBrowser = /Android/i.test(globalThis.navigator?.userAgent || "");
     const { mount, mountNav } = resolveLocaleFenceMount({
       allowStandalone,
@@ -3325,21 +3579,75 @@
       nav,
     });
     const existingRoot = document.querySelector("[data-localefence-root]");
+    // Mobile layouts (horizontal bottom tab bar) are served through the side
+    // drawer, and there is no floating button on any layout: without a
+    // sidebar there is simply no trigger node (the media viewer, which has
+    // neither navigation nor drawer, stays completely clean). The dialog
+    // overlay is built lazily on first open and never touched here.
+    const mobileContext = androidBrowser || Boolean(compactViewport);
+    const drawerLayout = mountNav
+      ? shouldUseDrawerLocaleFence(findLocaleFenceTabContainer(mountNav))
+      : mobileContext;
+    const sidebarLayout = Boolean(mountNav) && !drawerLayout;
+    // The drawer only exists in mobile layouts. Arming it here (instead of
+    // scanning on every desktop mutation batch) keeps full-document anchor
+    // scans — and any chance of injecting into a stray desktop settings
+    // link — at zero on desktop.
+    if (drawerLayout || mobileContext) localeFenceDrawerArmed = true;
     if (existingRoot) {
       existingRoot.dataset.theme = getPageTheme();
-      if (mountNav) placeLocaleFenceInNav(existingRoot, mountNav);
+      if (drawerLayout) {
+        // The drawer owns the entry on mobile: drop any legacy floating
+        // button from earlier versions.
+        disconnectLocaleFenceNavObserver();
+        existingRoot.remove();
+        ensureLocaleFenceDrawerEntry();
+        return;
+      }
+      if (mountNav) {
+        // Legacy floating buttons from earlier versions move into the sidebar.
+        placeLocaleFenceInNav(existingRoot, mountNav);
+        bindLocaleFenceTrigger(existingRoot);
+        return;
+      }
+      // There is no floating button anymore: without sidebar navigation there
+      // is no sidebar trigger, so drop any legacy fallback node instead of
+      // parking it on the page.
+      disconnectLocaleFenceNavObserver();
+      existingRoot.remove();
       return;
     }
-    if (!mount) return;
-    const wrapper = document.createElement("div");
-    wrapper.dataset.localefenceRoot = "true";
-    wrapper.dataset.localefenceStandalone = (!mountNav).toString();
-    wrapper.dataset.theme = getPageTheme();
-    wrapper.innerHTML = `
-      <button data-localefence-trigger type="button" aria-haspopup="dialog" aria-expanded="false">
+    if (drawerLayout) ensureLocaleFenceDrawerEntry();
+    if (!mount || !document.body) return;
+    // The trigger only ever lives in the sidebar: mobile layouts use the
+    // side drawer and there is no floating-button fallback anymore.
+    let wrapper = null;
+    if (sidebarLayout) {
+      wrapper = document.createElement("div");
+      wrapper.dataset.localefenceRoot = "true";
+      wrapper.dataset.theme = getPageTheme();
+    }
+    if (wrapper) {
+      wrapper.innerHTML = `
+      <button data-localefence-trigger type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="LocaleFence">
         <svg aria-hidden="true" viewBox="0 0 24 24"><path fill-rule="evenodd" clip-rule="evenodd" d="M3.75 5.5C3.75 4.67 4.42 4 5.25 4h13.5c.83 0 1.5.67 1.5 1.5 0 .37-.14.72-.39.99l-5.11 5.63V17c0 .57-.32 1.09-.82 1.34l-3 1.5c-.47.24-1.03.21-1.47-.06-.44-.27-.71-.76-.71-1.28v-6.38L4.14 6.49c-.25-.27-.39-.62-.39-.99zM5.85 6l4.49 5.49c.27.32.41.72.41 1.13v5.07l2-1v-4.07c0-.41.14-.81.41-1.13L17.65 6H5.85z" fill="currentColor"></path></svg>
         <span data-localefence-label>LocaleFence</span>
       </button>
+    `;
+    }
+    if (wrapper && mountNav) placeLocaleFenceInNav(wrapper, mountNav);
+    bindLocaleFenceTrigger(wrapper);
+  };
+
+  const buildLocaleFenceOverlay = () => {
+    // Built lazily on first open: a body-level node during X's boot wedges
+    // page load, while building it detached on a user gesture is safe.
+    if (wiredOpenMenu) return true;
+    if (!document.body) return false;
+    const overlay = document.createElement("div");
+    overlay.dataset.localefenceOverlay = "true";
+    overlay.dataset.theme = getPageTheme();
+    overlay.innerHTML = `
       <div data-localefence-backdrop></div>
       <div data-localefence-menu role="dialog" aria-modal="true" aria-labelledby="localefence-title">
         <div data-localefence-header>
@@ -3453,38 +3761,37 @@
         </div>
       </div>
     `;
-    const $ = (selector) => wrapper.querySelector(selector);
-    const triggerButton = $("[data-localefence-trigger]");
-    const closeButton = $("[data-localefence-close]");
-    const searchInput = $("[data-country-search]");
-    const countryRows = $("[data-country-rows]");
-    const statAccounts = $("[data-stat-accounts]");
-    const statLocations = $("[data-stat-locations]");
-    const statHidden = $("[data-stat-hidden]");
-    const hideToggle = $("[data-hide-matching]");
-    const blockToggle = $("[data-block-matching]");
-    const notificationsToggle = $("[data-notifications-enabled]");
-    const notificationSizeSelect = $("[data-notification-size]");
-    const notificationPositionSelect = $("[data-notification-position]");
-    const blockStatus = $("[data-block-status]");
-    const exclusionSummary = $("[data-exclusion-summary]");
-    const exclusionCount = $("[data-exclusion-count]");
-    const lookupStatus = $("[data-lookup-status]");
-    const lookupQuotaLabel = $("[data-lookup-quota]");
-    const historyList = $("[data-history-list]");
-    const historyCount = $("[data-history-count]");
-    const historyStats = $("[data-history-stats]");
-    const clearHistoryButton = $("[data-clear-history]");
-    const queueList = $("[data-queue-list]");
-    const queueCount = $("[data-queue-count]");
-    const queueStats = $("[data-queue-stats]");
-    const clearQueueButton = $("[data-clear-queue]");
-    const viewButtons = [...wrapper.querySelectorAll("[data-localefence-view]")];
-    const countryViews = [...wrapper.querySelectorAll("[data-country-view]")];
-    const historyViews = [...wrapper.querySelectorAll("[data-history-view]")];
-    const queueViews = [...wrapper.querySelectorAll("[data-queue-view]")];
-    const settingsViews = [...wrapper.querySelectorAll("[data-settings-view]")];
-    const sortButtons = [...wrapper.querySelectorAll("[data-sort-column]")];
+    const $$ = (selector) => overlay.querySelector(selector);
+    const closeButton = $$("[data-localefence-close]");
+    const searchInput = $$("[data-country-search]");
+    const countryRows = $$("[data-country-rows]");
+    const statAccounts = $$("[data-stat-accounts]");
+    const statLocations = $$("[data-stat-locations]");
+    const statHidden = $$("[data-stat-hidden]");
+    const hideToggle = $$("[data-hide-matching]");
+    const blockToggle = $$("[data-block-matching]");
+    const notificationsToggle = $$("[data-notifications-enabled]");
+    const notificationSizeSelect = $$("[data-notification-size]");
+    const notificationPositionSelect = $$("[data-notification-position]");
+    const blockStatus = $$("[data-block-status]");
+    const exclusionSummary = $$("[data-exclusion-summary]");
+    const exclusionCount = $$("[data-exclusion-count]");
+    const lookupStatus = $$("[data-lookup-status]");
+    const lookupQuotaLabel = $$("[data-lookup-quota]");
+    const historyList = $$("[data-history-list]");
+    const historyCount = $$("[data-history-count]");
+    const historyStats = $$("[data-history-stats]");
+    const clearHistoryButton = $$("[data-clear-history]");
+    const queueList = $$("[data-queue-list]");
+    const queueCount = $$("[data-queue-count]");
+    const queueStats = $$("[data-queue-stats]");
+    const clearQueueButton = $$("[data-clear-queue]");
+    const viewButtons = [...overlay.querySelectorAll("[data-localefence-view]")];
+    const countryViews = [...overlay.querySelectorAll("[data-country-view]")];
+    const historyViews = [...overlay.querySelectorAll("[data-history-view]")];
+    const queueViews = [...overlay.querySelectorAll("[data-queue-view]")];
+    const settingsViews = [...overlay.querySelectorAll("[data-settings-view]")];
+    const sortButtons = [...overlay.querySelectorAll("[data-sort-column]")];
     const countryOptions = new Map();
     const sortLabels = { selected: "✓", name: "Region", seen: "Accounts" };
     const sortDefaults = { selected: "desc", name: "asc", seen: "desc" };
@@ -3745,7 +4052,7 @@
       });
     };
     const renderStats = () => {
-      if (!wrapper.dataset.localefenceOpen) return;
+      if (!overlay.dataset.localefenceOpen) return;
       ensureCountryList();
       const { rows, total } = getLocationStats();
       const counts = new Map(rows);
@@ -3796,6 +4103,29 @@
       applyCountrySearch();
     };
     renderLocationStats = renderStats;
+    let savedBodyOverflow = "";
+    let savedDocumentOverflow = "";
+    let bodyScrollLocked = false;
+    const lockBodyScroll = () => {
+      // Fullscreen mobile sheet: keep the X feed behind from scrolling while
+      // the dialog is open. Values are restored verbatim on close.
+      if (bodyScrollLocked) return;
+      bodyScrollLocked = true;
+      try {
+        savedBodyOverflow = document.body?.style?.overflow ?? "";
+        savedDocumentOverflow = document.documentElement?.style?.overflow ?? "";
+        if (document.body) document.body.style.overflow = "hidden";
+        if (document.documentElement) document.documentElement.style.overflow = "hidden";
+      } catch { /* Scroll locking is best effort. */ }
+    };
+    const unlockBodyScroll = () => {
+      if (!bodyScrollLocked) return;
+      bodyScrollLocked = false;
+      try {
+        if (document.body) document.body.style.overflow = savedBodyOverflow;
+        if (document.documentElement) document.documentElement.style.overflow = savedDocumentOverflow;
+      } catch { /* Scroll locking is best effort. */ }
+    };
     const setActiveView = (view) => {
       currentView = ["countries", "queue", "history", "settings"].includes(view) ? view : "countries";
       countryViews.forEach((node) => {
@@ -3821,26 +4151,33 @@
     };
     const openMenu = () => {
       menuOpener = document.activeElement;
-      wrapper.dataset.theme = getPageTheme();
+      overlay.dataset.theme = getPageTheme();
       ensureCountryList();
-      wrapper.dataset.localefenceOpen = "true";
-      triggerButton.setAttribute("aria-expanded", "true");
+      overlay.dataset.localefenceOpen = "true";
+      triggerButtonNode?.setAttribute("aria-expanded", "true");
       setActiveView(currentView);
-      requestAnimationFrame(() => closeButton.focus());
+      lockBodyScroll();
+      requestAnimationFrame(() => {
+        try {
+          closeButton.focus({ preventScroll: true });
+        } catch {
+          closeButton.focus();
+        }
+      });
     };
     const closeMenu = () => {
-      if (!wrapper.dataset.localefenceOpen) return;
-      delete wrapper.dataset.localefenceOpen;
-      triggerButton.setAttribute("aria-expanded", "false");
+      if (!overlay.dataset.localefenceOpen) return;
+      delete overlay.dataset.localefenceOpen;
+      triggerButtonNode?.setAttribute("aria-expanded", "false");
+      unlockBodyScroll();
       if (menuOpener?.isConnected) menuOpener.focus();
       menuOpener = null;
     };
-    wrapper.addEventListener("click", async (event) => {
+    wiredOpenMenu = openMenu;
+    overlay.addEventListener("click", async (event) => {
       const target = event.target.closest?.("button,[data-localefence-backdrop]");
       if (!target) return;
-      if (target.matches("[data-localefence-trigger]")) {
-        openMenu();
-      } else if (target.matches("[data-localefence-backdrop],[data-localefence-close]")) {
+      if (target.matches("[data-localefence-backdrop],[data-localefence-close]")) {
         closeMenu();
       } else if (target.matches("[data-localefence-view]")) {
         setActiveView(target.dataset.localefenceView);
@@ -3948,14 +4285,17 @@
       }
     });
     document.addEventListener("keydown", (event) => {
-      if (!wrapper.dataset.localefenceOpen) return;
+      // Rebuilds attach a fresh handler, so ignore events for detached
+      // overlays instead of stacking stale focus traps.
+      if (!overlay.isConnected) return;
+      if (!overlay.dataset.localefenceOpen) return;
       if (event.key === "Escape") {
         event.preventDefault();
         closeMenu();
         return;
       }
       if (event.key !== "Tab") return;
-      const focusable = [...wrapper.querySelectorAll(
+      const focusable = [...overlay.querySelectorAll(
         '[data-localefence-menu] button:not([disabled]), [data-localefence-menu] input:not([disabled]), [data-localefence-menu] select:not([disabled]), [data-localefence-menu] a[href]',
       )].filter((element) => !element.closest("[hidden]") && getComputedStyle(element).display !== "none");
       if (!focusable.length) return;
@@ -3969,14 +4309,16 @@
         first.focus();
       }
     });
-    if (mountNav) placeLocaleFenceInNav(wrapper, mountNav);
-    else mount.appendChild(wrapper);
+    // The overlay enters the document here, on first open: appending a
+    // body-level node any earlier wedges X's boot (proven by A/B bisect).
+    document.body.appendChild(overlay);
     renderHistory();
     renderQueue();
     setActiveView("countries");
     updateActionControls();
     updateLookupStatus();
     updateLookupQuota();
+    return true;
   };
 
   let mountFailureReported = false;
@@ -4003,6 +4345,8 @@
   };
   let mountWatchdogAttempts = 0;
   const ensureRuntimeMount = () => {
+    // Only the sidebar trigger is watchdogged: the overlay is built lazily
+    // on first open, so its absence is the normal state, not a failure.
     if (document.querySelector("[data-localefence-root]")) return;
     ensureLocaleFenceStyles();
     tryMountLocaleFence(document, true);
@@ -4027,6 +4371,14 @@
   };
   if (document.readyState === "complete") resumeVisibleWork();
   else if (document.readyState === "interactive") scanDocument();
+  try {
+    // Rotating a phone (or resizing across breakpoints) must re-sync the
+    // trigger between sidebar and drawer layouts without waiting for the next
+    // X DOM mutation.
+    globalThis.matchMedia?.("(max-width: 700px)")?.addEventListener?.("change", () => {
+      tryMountLocaleFence(document, true);
+    });
+  } catch { /* Viewport listener is best effort. */ }
   document.addEventListener?.("DOMContentLoaded", scanDocument, { once: true });
   document.addEventListener?.("visibilitychange", resumeVisibleWork);
   globalThis.addEventListener("load", resumeVisibleWork, { once: true });
@@ -4040,23 +4392,50 @@
       if (document.readyState === "complete") resumeVisibleWork();
     });
 
+  const isLocaleFenceOwnedNode = (node) =>
+    node?.matches?.("[data-localefence-root], [data-localefence-overlay], [data-localefence-toasts]") ||
+    node?.closest?.("[data-localefence-root], [data-localefence-overlay], [data-localefence-toasts]");
   new MutationObserver((mutations) => {
     let runtimeWasRemoved = false;
+    let needsMountCheck = false;
+    let maybeDrawer = false;
     for (const { addedNodes, removedNodes } of mutations) {
       for (const node of removedNodes) {
+        const lostOverlay = node?.matches?.("[data-localefence-overlay]") ||
+          node?.querySelector?.("[data-localefence-overlay]");
         if (
+          lostOverlay ||
           node?.matches?.("[data-localefence-root]") ||
           node?.querySelector?.("[data-localefence-root]")
         ) runtimeWasRemoved = true;
+        if (lostOverlay && wiredOpenMenu) {
+          // The dialog rebuilds on next open: release the stale wiring and
+          // any scroll lock it held so a detached overlay cannot trap input.
+          wiredOpenMenu = null;
+          try {
+            document.body.style.overflow = "";
+            document.documentElement.style.overflow = "";
+          } catch { /* best effort */ }
+        }
       }
       for (const node of addedNodes) {
+        // Skip text nodes and our own UI: menu renders add hundreds of nodes
+        // that must not each trigger document-wide mount scans.
+        if (node?.nodeType !== 1 || isLocaleFenceOwnedNode(node)) continue;
         findTweets(node);
-        tryMountLocaleFence(node);
+        // Batch the expensive `:has()` navigation lookup to one check per
+        // mutation batch, and only when navigation could be involved. The
+        // drawer entry is likewise throttled (see
+        // maybeEnsureLocaleFenceDrawerEntry).
+        if (node.matches?.("nav") || node.querySelector?.("nav")) needsMountCheck = true;
+        else if (node.matches?.("a[href]") || node.querySelector?.("a[href]")) maybeDrawer = true;
       }
     }
-    if (runtimeWasRemoved) {
+    if (needsMountCheck) tryMountLocaleFence(document);
+    else if (runtimeWasRemoved) {
       ensureLocaleFenceStyles();
       tryMountLocaleFence(document, true);
     }
+    if (maybeDrawer) maybeEnsureLocaleFenceDrawerEntry();
   }).observe(document, { childList: true, subtree: true });
 })();

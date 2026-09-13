@@ -23,10 +23,17 @@ const instrumentedSource = source.replace(
     getRuntimeVersion: () => runtimeVersion,
     getSelectedLocations: () => [...selectedLocations],
     applyPostVisibility,
+    buildLocaleFenceDrawerEntry,
+    findLocaleFenceDrawerAnchor,
+    findTweets,
+    rowForLocaleFenceDrawerAnchor,
     enqueueBlock,
     fetchCountry,
     isKnownBlocked,
     isCompactLocaleFenceNav,
+    isHorizontalLocaleFenceNav,
+    isMobileLocaleFenceViewport,
+    shouldUseDrawerLocaleFence,
     isUnavailableAccount,
     pauseBlocking,
     placeLocaleFenceInNav,
@@ -214,8 +221,8 @@ const testAndroidMountRecovery = () => {
     runtimeDataset: { localefenceRuntime: "1.2.1" },
     storedBlockEnabled: "false",
   });
-  assert.equal(app.runtime(), "1.2.4", "a stale mobile-tab marker must not prevent reinjection");
-  assert.equal(app.hooks.getRuntimeVersion(), "1.2.4");
+  assert.equal(app.runtime(), "1.2.5", "a stale mobile-tab marker must not prevent reinjection");
+  assert.equal(app.hooks.getRuntimeVersion(), "1.2.5");
   const body = {};
   assert.equal(
     app.hooks.resolveLocaleFenceMount({
@@ -257,8 +264,54 @@ const testAndroidMountRecovery = () => {
     compactViewport: true,
     nav,
   });
-  assert.equal(compactMount.mount, nav, "X's navigation must win over the floating fallback on Android");
+  assert.equal(compactMount.mount, nav, "navigation must host the trigger on every layout, including mobile");
   assert.equal(compactMount.mountNav, nav);
+  const desktopMount = app.hooks.resolveLocaleFenceMount({
+    allowStandalone: false,
+    androidBrowser: true,
+    body,
+    compactViewport: false,
+    nav,
+  });
+  assert.equal(desktopMount.mount, nav, "desktop navigation must keep hosting the sidebar entry");
+  assert.equal(desktopMount.mountNav, nav);
+  const bottomTabBar = {
+    getBoundingClientRect: () => ({ width: 360, height: 56 }),
+    clientWidth: 360,
+    clientHeight: 56,
+  };
+  assert.equal(
+    app.hooks.isHorizontalLocaleFenceNav(bottomTabBar),
+    true,
+    "a short full-width tab bar must be detected as horizontal",
+  );
+  assert.equal(
+    app.hooks.resolveLocaleFenceMount({
+      allowStandalone: false,
+      androidBrowser: false,
+      body,
+      compactViewport: false,
+      nav: bottomTabBar,
+    }).mountNav,
+    bottomTabBar,
+    "mount resolution still reports the bottom bar so the layout decision can route it to the drawer",
+  );
+  assert.equal(
+    app.hooks.shouldUseDrawerLocaleFence(bottomTabBar),
+    true,
+    "a horizontal bottom bar must select the side-drawer layout",
+  );
+  assert.equal(
+    app.hooks.shouldUseDrawerLocaleFence({ getBoundingClientRect: () => ({ width: 88, height: 600 }) }),
+    false,
+    "a vertical sidebar must keep the desktop entry styling",
+  );
+  assert.equal(app.hooks.isMobileLocaleFenceViewport(), false);
+  assert.equal(
+    app.hooks.isCompactLocaleFenceNav(bottomTabBar),
+    true,
+    "a bottom tab bar must stay icon-only despite reporting full viewport width",
+  );
   assert.equal(
     app.hooks.isCompactLocaleFenceNav({ getBoundingClientRect: () => ({ width: 88 }) }),
     true,
@@ -270,7 +323,7 @@ const testAndroidMountRecovery = () => {
     "X's measured wide navigation must retain LocaleFence's text label",
   );
   const insertionPoint = {};
-  const floatingRoot = { dataset: { localefenceStandalone: "true" }, parentNode: body };
+  const legacyRoot = { dataset: { localefenceStandalone: "true" }, parentNode: body };
   const mountedNav = {
     getBoundingClientRect: () => ({ width: 88 }),
     lastElementChild: insertionPoint,
@@ -279,10 +332,204 @@ const testAndroidMountRecovery = () => {
       node.parentNode = this;
     },
   };
-  app.hooks.placeLocaleFenceInNav(floatingRoot, mountedNav);
-  assert.equal(floatingRoot.parentNode, mountedNav, "a mounted fallback must move into X's late navigation");
-  assert.equal(floatingRoot.dataset.localefenceStandalone, "false");
-  assert.equal(floatingRoot.dataset.localefenceCompact, "true");
+  app.hooks.placeLocaleFenceInNav(legacyRoot, mountedNav);
+  assert.equal(legacyRoot.parentNode, mountedNav, "a legacy fallback node must move into X's sidebar navigation");
+  assert.equal(legacyRoot.dataset.localefenceCompact, "true");
+};
+
+const makeDrawerAnchor = () => {
+  const svgClone = () => ({
+    attributes: {},
+    setAttribute(key, value) { this.attributes[key] = value; },
+    innerHTML: "<circle/>",
+  });
+  const rowClone = () => {
+    const listeners = {};
+    return {
+      attributes: { href: "/settings" },
+      dataset: {},
+      children: [svgClone(), { children: [], textContent: "Settings and privacy" }],
+      querySelector(selector) { return selector === "svg" ? this.children[0] : null; },
+      querySelectorAll(selector) { return selector === "span" || selector === "span, div" ? [this.children[1]] : []; },
+      removeAttribute(key) { delete this.attributes[key]; },
+      setAttribute(key, value) { this.attributes[key] = value; },
+      addEventListener(type, listener) { (listeners[type] ??= []).push(listener); },
+      fire(type, event) { (listeners[type] || []).forEach((listener) => listener(event)); },
+    };
+  };
+  const anchor = rowClone();
+  anchor.cloneNode = () => rowClone();
+  return anchor;
+};
+
+const testDrawerEntry = () => {
+  const app = boot({ currentOwner: "1", storedBlockEnabled: "false" });
+  const anchor = makeDrawerAnchor();
+  const entry = app.hooks.buildLocaleFenceDrawerEntry(anchor);
+  assert.equal(entry.dataset.localefenceDrawerEntry, "true", "the drawer row must be marked to avoid duplicates");
+  assert.equal(entry.attributes.href, undefined, "the drawer entry must not navigate away");
+  assert.equal(entry.attributes["aria-label"], "LocaleFence");
+  assert.equal(entry.children[1].textContent, "LocaleFence", "the cloned row must be relabeled");
+  assert.ok(
+    entry.children[0].innerHTML.includes("M3.75 5.5"),
+    "the cloned row must carry the LocaleFence glyph",
+  );
+  assert.equal(anchor.attributes.href, "/settings", "the original drawer row must keep navigating");
+  assert.equal(anchor.children[1].textContent, "Settings and privacy", "the original row label must be untouched");
+  assert.doesNotThrow(
+    () => entry.fire("click", { preventDefault() {} }),
+    "activating the entry without wiring must be a safe no-op",
+  );
+};
+
+const makeNestedDrawerRow = () => {
+  const label = { children: [], textContent: "Settings and privacy" };
+  const svg = {
+    attributes: {},
+    setAttribute(key, value) { this.attributes[key] = value; },
+    innerHTML: "",
+  };
+  const anchor = {
+    children: [label],
+    parentElement: null,
+    querySelector: () => null,
+    querySelectorAll: () => [],
+  };
+  const iconCell = {
+    children: [svg],
+    parentElement: null,
+    querySelector: (selector) => selector === "svg" ? svg : null,
+  };
+  const row = {
+    attributes: {},
+    dataset: {},
+    children: [iconCell, anchor],
+    parentElement: null,
+    querySelector: (selector) => {
+      if (selector === "svg") return svg;
+      if (selector === "span") return label;
+      return null;
+    },
+    querySelectorAll: (selector) => {
+      if (selector === "span, div") return [label];
+      return [];
+    },
+    removeAttribute() {},
+    setAttribute(key, value) { this.attributes[key] = value; },
+    addEventListener() {},
+    after() {},
+    cloneNode() {
+      const svgClone = {
+        attributes: {},
+        setAttribute(key, value) { this.attributes[key] = value; },
+        innerHTML: "",
+      };
+      const labelClone = { children: [], textContent: "Settings and privacy" };
+      const cloneListeners = {};
+      return {
+        attributes: {},
+        dataset: {},
+        children: [],
+        refs: { labelClone, svgClone },
+        querySelector: (selector) => selector === "svg" ? svgClone : null,
+        querySelectorAll: (selector) => {
+          if (selector === "span, div") return [labelClone];
+          return [];
+        },
+        removeAttribute() {},
+        setAttribute(key, value) { this.attributes[key] = value; },
+        addEventListener(type, listener) { (cloneListeners[type] ??= []).push(listener); },
+      };
+    },
+  };
+  anchor.parentElement = row;
+  iconCell.parentElement = row;
+  const sibling = () => ({ children: [{}], querySelector: (selector) => selector === "svg" ? {} : null });
+  row.parentElement = { children: [sibling(), sibling(), row, sibling()] };
+  return { anchor, label, row, svg };
+};
+
+const testDrawerRowResolution = () => {
+  const app = boot({ currentOwner: "1", storedBlockEnabled: "false" });
+  const { buildLocaleFenceDrawerEntry, rowForLocaleFenceDrawerAnchor } = app.hooks;
+  const { anchor, label, row, svg } = makeNestedDrawerRow();
+  assert.equal(
+    rowForLocaleFenceDrawerAnchor(anchor),
+    row,
+    "a nested drawer link must resolve to its full row so the entry is not clipped inside it",
+  );
+  const entry = buildLocaleFenceDrawerEntry(anchor);
+  assert.equal(entry.refs.labelClone.textContent, "LocaleFence", "the cloned row must be relabeled");
+  assert.ok(
+    entry.refs.svgClone.innerHTML.includes("M3.75 5.5"),
+    "the cloned row must carry the LocaleFence glyph",
+  );
+  assert.equal(label.textContent, "Settings and privacy", "the original row label must be untouched");
+  assert.equal(svg.innerHTML, "", "the original row icon must be untouched");
+};
+
+const makeDrawerLink = (href, label) => ({
+  attributes: { href },
+  textContent: label,
+  querySelector(selector) { return selector === "svg" ? {} : null; },
+  getAttribute(name) { return this.attributes[name]; },
+  closest() { return null; },
+});
+
+const testFindTweetsSkipsNonElements = () => {
+  const app = boot({ currentOwner: "1", storedBlockEnabled: "false" });
+  assert.doesNotThrow(() => {
+    app.hooks.findTweets(null);
+    app.hooks.findTweets(undefined);
+    app.hooks.findTweets({ nodeType: 3, textContent: "some text node" });
+    app.hooks.findTweets("a string");
+  }, "text and other non-element nodes must be ignored without throwing");
+};
+
+const testDrawerAnchorTiers = () => {
+  const app = boot({ currentOwner: "1", storedBlockEnabled: "false" });
+  const { findLocaleFenceDrawerAnchor } = app.hooks;
+  const settings = makeDrawerLink("/settings", "Settings and privacy");
+  assert.equal(
+    findLocaleFenceDrawerAnchor({ querySelector: () => settings, querySelectorAll: () => [] }),
+    settings,
+    "an exact /settings link must win immediately",
+  );
+  const nested = makeDrawerLink("/settings/account", "Impostazioni");
+  assert.equal(
+    findLocaleFenceDrawerAnchor({ querySelector: () => null, querySelectorAll: () => [nested] }),
+    nested,
+    "a nested settings path must match by href substring",
+  );
+  const logout = makeDrawerLink("/logout", "Esci");
+  const ads = makeDrawerLink("/i/ads", "Annunci");
+  const scopeWithDrawer = {
+    querySelector: () => null,
+    querySelectorAll: (selector) => {
+      if (selector === "a[href]") return [ads, nested, logout];
+      return [];
+    },
+  };
+  assert.equal(
+    findLocaleFenceDrawerAnchor(scopeWithDrawer),
+    nested,
+    "href-substring tiers must precede the logout-scoped fallbacks",
+  );
+  const nonSettingsScope = {
+    querySelector: () => null,
+    querySelectorAll: () => [ads, logout],
+  };
+  logout.closest = () => ({ querySelectorAll: () => [ads, logout] });
+  assert.equal(
+    findLocaleFenceDrawerAnchor(nonSettingsScope),
+    ads,
+    "the row above Log out must be used when no settings link exists",
+  );
+  assert.equal(
+    findLocaleFenceDrawerAnchor({ querySelector: () => null, querySelectorAll: () => [] }),
+    null,
+    "an empty document must yield no anchor",
+  );
 };
 
 const testNotificationPreferences = () => {
@@ -350,6 +597,66 @@ const testUiInteractionStyles = () => {
     source,
     /--lf-toast-top-right-offset: 72px;[\s\S]*?\[data-localefence-toasts\]\[data-position="top-right"\][\s\S]*?top: var\(--lf-toast-top-right-offset\);/,
     "desktop top-right notifications must clear X's search bar",
+  );
+  assert.ok(
+    !source.includes('localefenceStandalone = "true"'),
+    "no layout may create a floating button: the trigger lives in the sidebar or the drawer",
+  );
+  assert.ok(
+    !source.includes('[data-localefence-standalone="true"]'),
+    "no stylesheet rule may target a floating button anymore",
+  );
+  assert.ok(
+    source.includes("wiredOpenMenu"),
+    "dialog wiring must be tracked so a removed overlay rebuilds on next open",
+  );
+  assert.ok(
+    source.includes("buildLocaleFenceOverlay"),
+    "the overlay must be built lazily on first open, never during boot",
+  );
+  assert.ok(
+    source.includes("bindLocaleFenceTrigger"),
+    "sidebar trigger binding must be independent of dialog wiring",
+  );
+  assert.match(
+    source,
+    /\[data-localefence-overlay\]\[data-localefence-open="true"\] \[data-localefence-menu\][\s\S]*?display: flex;/,
+    "the settings dialog must be driven by the body-level overlay so the nav stacking context cannot trap it",
+  );
+  assert.ok(
+    source.includes("data-localefence-drawer-entry"),
+    "mobile layouts must inject a marked entry into X's side drawer",
+  );
+  assert.ok(
+    source.includes("data-localefence-mini"),
+    "small screens must render a minimal toast variant",
+  );
+  assert.ok(
+    source.includes("host.replaceChildren()"),
+    "a new mobile toast must replace the previous one instead of stacking",
+  );
+  assert.match(
+    source,
+    /miniToast \? 1200 :/,
+    "mobile toasts must dismiss after about a second",
+  );
+  assert.match(
+    source,
+    /\[data-localefence-toast\]\[data-localefence-mini="true"\][\s\S]*?border-radius: 9999px;/,
+    "the mobile toast must be a compact pill",
+  );
+  assert.match(
+    source,
+    /--lf-toast-top-right-offset: calc\(60px \+ env\(safe-area-inset-top\)\);/,
+    "mobile top-right toasts must sit below the app header",
+  );
+  assert.ok(
+    source.includes('a[href="/settings"]'),
+    "the drawer entry must anchor on X's locale-independent settings link",
+  );
+  assert.ok(
+    source.includes('aria-label="LocaleFence"'),
+    "the icon-only tab trigger must expose an accessible name",
   );
 };
 
@@ -961,6 +1268,10 @@ const testCompleteReset = async () => {
 
 const run = async () => {
   testAndroidMountRecovery();
+  testDrawerEntry();
+  testDrawerRowResolution();
+  testDrawerAnchorTiers();
+  testFindTweetsSkipsNonElements();
   testNotificationPreferences();
   testUiInteractionStyles();
   await testSharedLookupCacheAvoidsCrossTabRequest();
