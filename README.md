@@ -34,7 +34,7 @@ It is local-first: there is no LocaleFence server, analytics, or external data s
 2. Open **[LocaleFence on Greasy Fork](https://greasyfork.org/en/scripts/585483-localefence-for-x)** and confirm the installation.
 3. Open or reload [x.com](https://x.com/).
 
-LocaleFence adds an item to X's navigation, including the compact left sidebar used by X on Android. If X has not built its navigation yet, LocaleFence uses a temporary floating fallback and automatically moves it into the sidebar when the navigation appears. The settings panel is full-screen on narrow displays.
+LocaleFence adds an item to X's desktop sidebar and mobile side drawer. The entry appears when X builds its navigation. The settings panel is full-screen on narrow displays and opens when you select the entry.
 
 The userscript keeps its original metadata name, **LocaleFence for X**, so existing Greasy Fork installations continue to be recognized as the same script. The browser-extension title is **LocaleFence - Country Filter for X**.
 
@@ -43,6 +43,7 @@ The userscript keeps its original metadata name, **LocaleFence for X**, so exist
 The repository now builds minimal Manifest V3 packages for Chromium and Firefox. Until signed store releases are available, build them locally:
 
 ```sh
+npm ci
 npm test
 npm run build:extension
 ```
@@ -133,9 +134,10 @@ See the full [privacy policy](PRIVACY.md).
 
 ## Development
 
-The project has no runtime dependencies. Run the safety and extension-metadata checks with:
+The project has no runtime dependencies. Its persistence tests use `fake-indexeddb` as a development dependency. Install the development dependencies and run the safety, persistence, and extension-metadata checks with:
 
 ```sh
+npm ci
 npm test
 ```
 

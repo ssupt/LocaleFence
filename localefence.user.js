@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LocaleFence for X
 // @namespace    https://github.com/ssupt/LocaleFence
-// @version      1.2.5
+// @version      1.2.6
 // @description  See X account countries, hide matching posts, and optionally block matching accounts
 // @author       ssupt
 // @license      GPL-3.0-only
@@ -24,7 +24,7 @@
   // running when someone has installed both distributions. A synchronous
   // ping distinguishes a live runtime from a stale marker restored by a
   // discarded mobile tab.
-  const runtimeVersion = "1.2.5";
+  const runtimeVersion = "1.2.6";
   const runtimePingEvent = "localefence:runtime-ping";
   const runtimeRoot = document.documentElement;
   const pingExistingRuntime = () => {
@@ -186,6 +186,11 @@
   const blockQueue = [];
   const queuedBlockIds = new Set();
   const blockHistory = [];
+  // Reset invalidates work started before the local stores were cleared.
+  let dataGeneration = 0;
+  let resetInProgress = false;
+  let lastResetAt = 0;
+  const activeLookupRequests = new Set();
   const excludedUserIds = new Set(
     (readStorage("localefence.excludedUserIds") || "").split("\n").filter(Boolean),
   );
@@ -195,6 +200,7 @@
   const blockPausedStorageKey = "localefence.blockPaused";
   const blockOwnerStorageKey = "localefence.blockOwnerRestId";
   const blockedAccountStorageKey = "localefence.blockedAccounts";
+  const resetSignalStorageKey = "localefence.resetSignal";
   const maxBlockedAccountEntries = 10000;
   const isRestId = (value) => /^\d+$/.test(value || "");
   const blockAccountKey = (ownerRestId, restId) =>
@@ -857,7 +863,10 @@
       if (mappedRestId === user.restId && mappedKey !== key) screenNames.delete(mappedKey);
     });
     aboutUsers.set(user.restId, user);
-    screenNames.set(key, user.restId);
+    const mappedUser = aboutUsers.get(screenNames.get(key));
+    if (!mappedUser || Number(mappedUser.updatedAt) <= Number(user.updatedAt)) {
+      screenNames.set(key, user.restId);
+    }
     return true;
   };
   const readSharedLookupCache = () =>
@@ -991,15 +1000,29 @@
     request.onblocked = () => finish(null);
   });
 
-  const fetchWithTimeout = async (url, options, timeoutMs) => {
+  const fetchWithTimeout = async (url, options, timeoutMs, readResponse, cancelOnReset = false) => {
     const Controller = globalThis.AbortController;
-    if (!Controller) return globalThis.fetch(url, options);
-    const controller = new Controller();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const controller = Controller ? new Controller() : null;
+    let cancel;
+    const cancellation = new Promise((resolve, reject) => {
+      cancel = () => {
+        controller?.abort();
+        const error = new Error("X request timed out or was cancelled");
+        error.name = "AbortError";
+        reject(error);
+      };
+    });
+    const timeout = setTimeout(cancel, timeoutMs);
+    if (cancelOnReset) activeLookupRequests.add(cancel);
     try {
-      return await globalThis.fetch(url, { ...options, signal: controller.signal });
+      const request = async () => {
+        const response = await globalThis.fetch(url, controller ? { ...options, signal: controller.signal } : options);
+        return readResponse(response);
+      };
+      return await Promise.race([request(), cancellation]);
     } finally {
       clearTimeout(timeout);
+      activeLookupRequests.delete(cancel);
     }
   };
   const requestResult = (request, fallback) =>
@@ -1007,17 +1030,6 @@
       request.onsuccess = () => resolve(request.result ?? fallback);
       request.onerror = () => resolve(fallback);
     });
-  const getEntries = (db, storeName) => {
-    try {
-      const store = db.transaction(storeName, "readonly").objectStore(storeName);
-      return Promise.all([
-        requestResult(store.getAllKeys(), []),
-        requestResult(store.getAll(), []),
-      ]).then(([keys, values]) => keys.slice(0, values.length).map((key, index) => [key, values[index]]));
-    } catch {
-      return Promise.resolve([]);
-    }
-  };
   const getValues = (db, storeName) => {
     try {
       const request = db.transaction(storeName, "readonly").objectStore(storeName).getAll();
@@ -1032,30 +1044,42 @@
       tx.onerror = () => resolve(false);
       tx.onabort = () => resolve(false);
     });
-  const replaceStore = (db, storeName, entries) => {
-    try {
-      const tx = db.transaction(storeName, "readwrite");
-      const store = tx.objectStore(storeName);
-      store.clear();
-      entries.forEach(([key, value]) => {
-        store.put(value, key);
-      });
-      return transactionDone(tx);
-    } catch {
-      return Promise.resolve(false);
-    }
-  };
-  const replaceValueStore = (db, storeName, values) => {
-    try {
-      const tx = db.transaction(storeName, "readwrite");
-      const store = tx.objectStore(storeName);
-      store.clear();
-      values.forEach((value) => store.put(value));
-      return transactionDone(tx);
-    } catch {
-      return Promise.resolve(false);
-    }
-  };
+  // Read and prune in one transaction so another tab's later writes survive.
+  const readAndPruneStore = (db, storeName, retainEntries) =>
+    new Promise((resolve) => {
+      try {
+        const tx = db.transaction(storeName, "readwrite");
+        const store = tx.objectStore(storeName);
+        const keysRequest = store.getAllKeys();
+        const valuesRequest = store.getAll();
+        let keys;
+        let values;
+        let retained = [];
+        const prune = () => {
+          if (!keys || !values) return;
+          try {
+            retained = retainEntries(keys.map((key, index) => [key, values[index]]));
+            const retainedKeys = new Set(retained.map(([key]) => key));
+            keys.forEach((key) => {
+              if (!retainedKeys.has(key)) store.delete(key);
+            });
+            retained.forEach(([key, value]) => {
+              if (store.keyPath == null) store.put(value, key);
+              else store.put(value);
+            });
+          } catch {
+            tx.abort();
+          }
+        };
+        keysRequest.onsuccess = () => { keys = keysRequest.result; prune(); };
+        valuesRequest.onsuccess = () => { values = valuesRequest.result; prune(); };
+        tx.oncomplete = () => resolve(retained);
+        tx.onerror = () => resolve([]);
+        tx.onabort = () => resolve([]);
+      } catch {
+        resolve([]);
+      }
+    });
   const processAboutUser = (user) => {
     if (!isRestId(user?.rest_id) || !usernameKey(user?.core?.screen_name)) return null;
     return compact({
@@ -1090,14 +1114,14 @@
     });
     return removed.map((user) => user.restId);
   };
-  const saveAboutUser = async (user, removedRestIds = []) => {
+  const saveAboutUser = async (user, removedRestIds = [], generation = dataGeneration) => {
     if (!user.restId) return false;
     const key = usernameKey(user.screenName);
     removeScreenNameMappings(user.restId, key);
     if (key) screenNames.set(key, user.restId);
     try {
       const db = await dbPromise;
-      if (!db) return false;
+      if (!db || generation !== dataGeneration || resetInProgress) return false;
       const tx = db.transaction("aboutUsers", "readwrite");
       const store = tx.objectStore("aboutUsers");
       store.put(user, user.restId);
@@ -1107,14 +1131,14 @@
       return false;
     }
   };
-  const saveAboutResponse = async (json) => {
+  const saveAboutResponse = async (json, generation = dataGeneration) => {
     const aboutUser = processAboutUser(json?.data?.user_result_by_screen_name?.result);
-    if (!aboutUser) return null;
+    if (!aboutUser || generation !== dataGeneration || resetInProgress) return null;
     cacheAboutUserInMemory(aboutUser);
     forgetUnavailableAccount(aboutUser.screenName);
     rememberSharedAboutUser(aboutUser);
     const removedRestIds = pruneAboutUsers();
-    await saveAboutUser(aboutUser, removedRestIds);
+    await saveAboutUser(aboutUser, removedRestIds, generation);
     return aboutUser;
   };
   const clearCacheStores = async () => {
@@ -1174,10 +1198,12 @@
     renderBlockHistory();
   };
   const addBlockHistoryEntry = async (entry) => {
+    const generation = dataGeneration;
+    if (resetInProgress) return null;
     let id = `memory:${Date.now()}:${entry.restId}`;
     try {
       const db = await dbPromise;
-      if (db) {
+      if (db && generation === dataGeneration && !resetInProgress) {
         const tx = db.transaction("blockHistory", "readwrite");
         const done = transactionDone(tx);
         const request = tx.objectStore("blockHistory").add(entry);
@@ -1188,6 +1214,7 @@
         if (await done && persistedId != null) id = persistedId;
       }
     } catch { /* Keep the entry in memory when IndexedDB is unavailable. */ }
+    if (generation !== dataGeneration || resetInProgress) return null;
     const savedEntry = { ...entry, id };
     blockHistory.unshift(savedEntry);
     await trimBlockHistory();
@@ -1198,11 +1225,12 @@
     if (id == null) return;
     const entry = blockHistory.find((item) => item.id === id);
     if (!entry) return;
+    const generation = dataGeneration;
     entry.status = status;
     renderBlockHistory();
     try {
       const db = await dbPromise;
-      if (!db) return;
+      if (!db || generation !== dataGeneration || resetInProgress || !blockHistory.includes(entry)) return;
       const tx = db.transaction("blockHistory", "readwrite");
       tx.objectStore("blockHistory").put(entry);
       await transactionDone(tx);
@@ -1220,17 +1248,20 @@
     } catch { /* IndexedDB persistence is best effort. */ }
   };
   const persistLookupRecord = async (record) => {
+    if (resetInProgress) return;
+    const generation = dataGeneration;
     lookupRecords.set(record.key, record);
     renderLookupQueue();
     try {
       const db = await dbPromise;
-      if (!db) return;
+      if (!db || generation !== dataGeneration || resetInProgress || lookupRecords.get(record.key) !== record) return;
       const tx = db.transaction("lookupQueue", "readwrite");
       tx.objectStore("lookupQueue").put(record);
       await transactionDone(tx);
     } catch { /* IndexedDB persistence is best effort. */ }
   };
   const removeLookupRecord = async (username) => {
+    const generation = dataGeneration;
     const key = usernameKey(username);
     const record = lookupRecords.get(key);
     const timer = lookupRetryTimers.get(key);
@@ -1251,7 +1282,7 @@
     renderActionControls();
     try {
       const db = await dbPromise;
-      if (!db) return;
+      if (!db || generation !== dataGeneration || resetInProgress || lookupRecords.has(key)) return;
       const tx = db.transaction("lookupQueue", "readwrite");
       tx.objectStore("lookupQueue").delete(key);
       await transactionDone(tx);
@@ -1277,6 +1308,7 @@
     const record = {
       key,
       username,
+      ownerRestId: getOwnRestId() || "",
       tweetText: snapshot.tweetText,
       tweetUrl: snapshot.tweetUrl,
       enqueuedAt: Date.now(),
@@ -1356,36 +1388,48 @@
     });
     renderActionControls();
   };
-  const resetLocaleFenceData = async () => {
-    disableBlocking();
-    await Promise.all([clearLookupRecords(), clearBlockHistory(), clearCacheStores()]);
-    aboutUsers.clear();
-    screenNames.clear();
-    selectedLocations.clear();
-    excludedUserIds.clear();
-    blockedAccountKeys.clear();
-    blockOwnerRestId = "";
-    hideEnabled = true;
-    notificationsEnabled = true;
-    notificationSize = "compact";
-    notificationPosition = "top-right";
-    lookupQuota = null;
-    countrySort = "default";
-    blockSuccessCount = 0;
-    totalBlockedCount = 0;
-    blockErrorMessage = "";
-    setLookupStatus();
-    removeStorageByPrefix("localefence.");
-    document.querySelectorAll("[data-account-based-in]").forEach((node) => node.remove());
-    document.querySelectorAll("[data-localefence-hidden]").forEach((node) => {
-      delete node.dataset.localefenceHidden;
-    });
-    document.querySelector("[data-localefence-toasts]")?.remove();
-    renderLocationStats();
-    renderLookupQueue();
-    renderBlockHistory();
-    renderActionControls();
-    renderLookupQuota();
+  const resetLocaleFenceData = async (broadcast = true) => {
+    if (resetInProgress) return;
+    resetInProgress = true;
+    lastResetAt = Date.now();
+    dataGeneration += 1;
+    activeLookupRequests.forEach((cancel) => cancel());
+    if (broadcast) writeStorage(resetSignalStorageKey, `${Date.now()}:${Math.random()}`);
+    try {
+      disableBlocking();
+      await hydrationReady;
+      dataGeneration += 1;
+      await Promise.all([clearLookupRecords(), clearBlockHistory(), clearCacheStores()]);
+      aboutUsers.clear();
+      screenNames.clear();
+      selectedLocations.clear();
+      excludedUserIds.clear();
+      blockedAccountKeys.clear();
+      blockOwnerRestId = "";
+      hideEnabled = true;
+      notificationsEnabled = true;
+      notificationSize = "compact";
+      notificationPosition = "top-right";
+      lookupQuota = null;
+      countrySort = "default";
+      blockSuccessCount = 0;
+      totalBlockedCount = 0;
+      blockErrorMessage = "";
+      setLookupStatus();
+      removeStorageByPrefix("localefence.");
+      document.querySelectorAll("[data-account-based-in]").forEach((node) => node.remove());
+      document.querySelectorAll("[data-localefence-hidden]").forEach((node) => {
+        delete node.dataset.localefenceHidden;
+      });
+      document.querySelector("[data-localefence-toasts]")?.remove();
+      renderLocationStats();
+      renderLookupQueue();
+      renderBlockHistory();
+      renderActionControls();
+      renderLookupQuota();
+    } finally {
+      resetInProgress = false;
+    }
   };
   const ensureBlockOwner = () => {
     if (!blockEnabled) return false;
@@ -1395,8 +1439,36 @@
     showToast(message, { error: true });
     return false;
   };
+  const syncBlockingPreferences = () => {
+    // Storage events can arrive after a newer failure or user setting. Only
+    // the current persisted values may resume work; observers never clear a pause.
+    const nextOwner = readStorage(blockOwnerStorageKey) || "";
+    const enabled = readStorage(blockEnabledStorageKey) === "true";
+    const ownerChanged = blockOwnerRestId !== nextOwner;
+    blockOwnerRestId = nextOwner;
+    if (!enabled || nextOwner !== getOwnRestId() || !selectedLocations.size) {
+      disableBlocking(enabled
+        ? "Automatic blocking was not enabled because the active X account or filters differ."
+        : "", false);
+      return;
+    }
+    if (ownerChanged) clearBlockQueue();
+    blockEnabled = true;
+    blockPaused = readStorage(blockPausedStorageKey) === "true";
+    blockErrorMessage = blockPaused
+      ? "Paused after a block request error. Turn blocking off and on to retry."
+      : "";
+    if (blockPaused) clearBlockQueue();
+    else {
+      refreshProcessedAccounts();
+      resumeAwaitingBlocks();
+    }
+    renderActionControls();
+  };
   globalThis.addEventListener("storage", (event) => {
-    if (event.key === null) {
+    if (event.key === resetSignalStorageKey) {
+      if (event.newValue) void resetLocaleFenceData(false);
+    } else if (event.key === null) {
       blockOwnerRestId = "";
       lookupBackoffUntil = 0;
       selectedLocations.clear();
@@ -1416,42 +1488,8 @@
       renderLocationStats();
       renderActionControls();
       renderLookupQuota();
-    } else if (event.key === blockOwnerStorageKey) {
-      const ownerChanged = blockOwnerRestId && blockOwnerRestId !== (event.newValue || "");
-      blockOwnerRestId = event.newValue || "";
-      if (blockEnabled && ownerChanged) {
-        disableBlocking("Automatic blocking is waiting for the new X account settings.", false);
-      } else if (blockEnabled) {
-        ensureBlockOwner();
-      }
-    } else if (event.key === blockEnabledStorageKey) {
-      if (event.newValue !== "true") {
-        if (blockEnabled) disableBlocking("", false);
-      } else {
-        blockOwnerRestId = readStorage(blockOwnerStorageKey) || blockOwnerRestId;
-        if (blockOwnerRestId === getOwnRestId() && selectedLocations.size) {
-          blockEnabled = true;
-          blockPaused = false;
-          blockErrorMessage = "";
-          writeStorage(blockPausedStorageKey, false);
-          refreshProcessedAccounts();
-          resumeAwaitingBlocks();
-          renderActionControls();
-        } else {
-          disableBlocking("Automatic blocking was not enabled because the active X account or filters differ.");
-        }
-      }
-    } else if (event.key === blockPausedStorageKey) {
-      blockPaused = blockEnabled && event.newValue === "true";
-      if (blockPaused) {
-        blockErrorMessage = "Paused after a block request error. Turn blocking off and on to retry.";
-        clearBlockQueue();
-      } else if (blockEnabled) {
-        blockErrorMessage = "";
-        refreshProcessedAccounts();
-        resumeAwaitingBlocks();
-      }
-      renderActionControls();
+    } else if ([blockOwnerStorageKey, blockEnabledStorageKey, blockPausedStorageKey].includes(event.key)) {
+      syncBlockingPreferences();
     } else if (event.key === lookupBackoffStorageKey) {
       syncLookupBackoffUntil();
       if (lookupBackoffUntil) {
@@ -1496,7 +1534,9 @@
         aboutUsers.clear();
         screenNames.clear();
         document.querySelectorAll("[data-account-based-in]").forEach((node) => node.remove());
-        findTweets(document);
+        // A reset in another tab clears the shared cache too. Leave the
+        // already-visible feed empty until new posts or a later page scan.
+        if (!resetInProgress && Date.now() - lastResetAt > 5000) findTweets(document);
         renderLocationStats();
       } else {
         syncSharedLookupCache();
@@ -1546,8 +1586,9 @@
     const csrfToken = getCsrfToken();
     if (!csrfToken) throw new Error("X session CSRF token is unavailable");
     let response;
+    let responseJson;
     try {
-      response = await fetchWithTimeout(url, {
+      ({ response, json: responseJson } = await fetchWithTimeout(url, {
         method: "POST",
         headers: {
           authorization: authToken,
@@ -1559,19 +1600,22 @@
         },
         credentials: "include",
         body: new URLSearchParams({ user_id: restId }).toString(),
-      }, blockRequestTimeoutMs);
+      }, blockRequestTimeoutMs, async (response) => {
+        let json = null;
+        try {
+          json = await response.json();
+        } catch (error) {
+          if (error?.name === "AbortError") throw error;
+        }
+        return { response, json };
+      }));
     } catch (error) {
       if (error?.name === "AbortError") {
         throw new Error("X request timed out; its result is unknown");
       }
       throw error;
     }
-    let responseJson = null;
-    let details = "";
-    try {
-      responseJson = await response.json();
-      details = responseJson?.errors?.map((error) => error.message).filter(Boolean).join("; ") || "";
-    } catch { /* An error body is optional. */ }
+    const details = responseJson?.errors?.map((error) => error.message).filter(Boolean).join("; ") || "";
     if (response.ok && !details) return responseJson;
     throw new Error(`X returned ${response.status}${details ? `: ${details}` : ""}`);
   };
@@ -1620,6 +1664,7 @@
     blockProcessing = true;
     try {
       while (blockEnabled && blockQueue.length) {
+        const generation = dataGeneration;
         const { country, restId, tweetText, tweetUrl, username } = blockQueue.shift();
         queuedBlockIds.delete(restId);
         const key = usernameKey(username);
@@ -1639,6 +1684,7 @@
         let outcome = "cancelled";
         try {
           outcome = await withBlockRequestLock(requestOwnerRestId, async () => {
+            if (generation !== dataGeneration || resetInProgress) return "cancelled";
             refreshBlockedAccountKeys();
             if (isKnownBlocked(requestOwnerRestId, restId)) return "known";
             if (!lookupRecords.has(key) || !ensureBlockOwner() || blockOwnerRestId !== requestOwnerRestId) {
@@ -1662,15 +1708,18 @@
               excludedUserIds.has(restId)
             ) return "cancelled";
             await blockAccount(restId);
+            if (generation !== dataGeneration || resetInProgress) return "cancelled";
             rememberBlockedAccount(requestOwnerRestId, restId);
             return "blocked";
           });
         } catch (error) {
+          if (generation !== dataGeneration || resetInProgress) continue;
           pauseBlocking(
             `Paused after an error: ${error?.message || "block request failed"}. Turn blocking off and on to retry.`,
           );
           continue;
         }
+        if (generation !== dataGeneration || resetInProgress) continue;
         if (outcome === "known") {
           markFeedAccount(username, "Blocked");
           await removeLookupRecord(username);
@@ -1696,6 +1745,7 @@
             status: "blocked",
           });
           await removal;
+          if (generation !== dataGeneration || resetInProgress) continue;
           showToast(`${label} was blocked`, {
             actionLabel: "Exclude",
             country,
@@ -1711,6 +1761,7 @@
           });
         } catch (error) {
           await removal;
+          if (generation !== dataGeneration || resetInProgress) continue;
           console.warn("LocaleFence blocked an account but could not finish local bookkeeping", error);
           showToast(`${label} was blocked, but LocaleFence could not save its local history.`, {
             country,
@@ -1801,10 +1852,19 @@
     const key = usernameKey(username);
     const lookupRecord = lookupRecords.get(key);
     if (!lookupRecord) return;
+    if (blockEnabled) ensureBlockOwner();
     const identityVerified = verifiedUser?.restId && usernameKey(verifiedUser.screenName) === key;
     const restId = identityVerified ? verifiedUser.restId : "";
     const excluded = restId && excludedUserIds.has(restId);
-    if (blockEnabled && isLocationMatched(country) && identityVerified && !excluded) {
+    // Records from older versions have no owner and cannot authorize a block.
+    const recordBelongsToOwner = lookupRecord.ownerRestId && lookupRecord.ownerRestId === blockOwnerRestId;
+    if (
+      blockEnabled &&
+      recordBelongsToOwner &&
+      isLocationMatched(country) &&
+      identityVerified &&
+      !excluded
+    ) {
       const snapshot = { tweetText: lookupRecord.tweetText, tweetUrl: lookupRecord.tweetUrl };
       updateLookupRecord(username, {
         status: "awaiting_block",
@@ -1885,37 +1945,28 @@
   const hydrateCache = async () => {
     const db = await dbPromise;
     if (!db) return;
-    const [storedAboutUsers, , storedLookupRecords] = await Promise.all([
-      getEntries(db, "aboutUsers"),
+    const [aboutEntries, , retainedLookupRecords] = await Promise.all([
+      readAndPruneStore(db, "aboutUsers", (entries) => entries
+        .map(([restId, user]) => normalizeStoredUser(restId, user))
+        .filter((user) => user.restId && usernameKey(user.screenName) && !isCacheExpired(user.updatedAt))
+        .sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt))
+        .slice(0, maxCachedAccounts)
+        .map((user) => [user.restId, user])),
       loadBlockHistory(db),
-      getValues(db, "lookupQueue"),
+      readAndPruneStore(db, "lookupQueue", (entries) => entries
+        .map(([, record]) => record)
+        .filter((record) => record?.key && usernameKey(record.username) === record.key)
+        .sort((a, b) => Number(a.enqueuedAt) - Number(b.enqueuedAt))
+        .slice(-maxLookupQueueEntries)
+        // No request survives a page reload. Make interrupted checks eligible again.
+        .map((record) => [record.key, record.status === "checking"
+          ? { ...record, status: "lookup", lastError: "" }
+          : record])),
     ]);
-    const aboutEntries = storedAboutUsers
-      .map(([restId, user]) => normalizeStoredUser(restId, user))
-      .filter((user) => user.restId && usernameKey(user.screenName) && !isCacheExpired(user.updatedAt))
-      .sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt))
-      .slice(0, maxCachedAccounts)
-      .map((user) => [user.restId, user]);
-    aboutEntries.forEach(([, nextUser]) => {
-      const key = usernameKey(nextUser.screenName);
-      aboutUsers.set(nextUser.restId, nextUser);
-      if (!screenNames.has(key)) screenNames.set(key, nextUser.restId);
-    });
-    await replaceStore(db, "aboutUsers", aboutEntries);
-    const retainedLookupRecords = storedLookupRecords
-      .filter((record) => record?.key && record?.username)
-      .sort((a, b) => Number(a.enqueuedAt) - Number(b.enqueuedAt))
-      .slice(-maxLookupQueueEntries)
-      // A browser shutdown or reload can interrupt a request after it was
-      // marked as checking. No request survives that page, so make it eligible
-      // for processing again instead of showing a permanently stuck item.
-      .map((record) => record.status === "checking"
-        ? { ...record, status: "lookup", lastError: "" }
-        : record);
-    retainedLookupRecords.forEach((record) => {
+    aboutEntries.forEach(([, nextUser]) => cacheAboutUserInMemory(nextUser));
+    retainedLookupRecords.forEach(([, record]) => {
       if (!lookupRecords.has(record.key)) lookupRecords.set(record.key, record);
     });
-    await replaceValueStore(db, "lookupQueue", retainedLookupRecords);
     lookupRecords.forEach((record) => {
       if (record.status === "awaiting_block") return;
       if (record.status === "failed") return;
@@ -2079,21 +2130,26 @@
     return false;
   };
   const fetchCountry = async (username, options = {}) => {
-    const { method = "POST", recoveredQueryId = false } = options;
+    const { method = "POST", recoveredQueryId = false, generation = dataGeneration } = options;
+    if (generation !== dataGeneration || resetInProgress) return { cancelled: true };
     const requestedQueryId = aboutQueryId;
     const url = `${getAboutQueryUrl()}?${new URLSearchParams({ variables: JSON.stringify({ screenName: username }) })}`;
     const csrfToken = getCsrfToken();
     if (!csrfToken) return { found: false, retryable: true, reason: "session", retryAfterMs: 1500 };
     try {
       // The request uses the signed-in X session and only asks for account location metadata.
-      const res = await fetchWithTimeout(url, {
+      const { response: res, json } = await fetchWithTimeout(url, {
         method,
         headers: {
           authorization: authToken,
           "x-csrf-token": csrfToken,
         },
         credentials: "include",
-      }, countryRequestTimeoutMs);
+      }, countryRequestTimeoutMs, async (response) => ({
+        response,
+        json: response.ok ? await response.json() : null,
+      }), true);
+      if (generation !== dataGeneration || resetInProgress) return { cancelled: true };
       const rateLimit = readRateLimit(res.headers);
       rememberLookupQuota(rateLimit);
       if (res.status === 429) {
@@ -2103,16 +2159,17 @@
       }
       if (!res.ok) {
         if (res.status === 405 && method === "POST") {
-          return fetchCountry(username, { method: "GET", recoveredQueryId });
+          return fetchCountry(username, { method: "GET", recoveredQueryId, generation });
         }
         if (!recoveredQueryId && [400, 404].includes(res.status) && recoverAboutQueryId(requestedQueryId)) {
-          return fetchCountry(username, { method, recoveredQueryId: true });
+          return fetchCountry(username, { method, recoveredQueryId: true, generation });
         }
         const retryable = [401, 403, 429].includes(res.status) || res.status >= 500;
         return { found: false, retryable, status: res.status, ...rateLimit };
       }
-      const json = await res.json();
-      const aboutUser = await saveAboutResponse(json);
+      if (generation !== dataGeneration || resetInProgress) return { cancelled: true };
+      const aboutUser = await saveAboutResponse(json, generation);
+      if (generation !== dataGeneration || resetInProgress) return { cancelled: true };
       if (aboutUser) return { country: aboutUser.country, found: true, user: aboutUser, ...rateLimit };
       const graphQlErrors = json?.errors?.map((error) => error?.message).filter(Boolean);
       const rawProfileResult = json?.data?.user_result_by_screen_name?.result;
@@ -2128,11 +2185,12 @@
         !recoveredQueryId &&
         graphQlErrors?.some((message) => /operation|persisted|query/i.test(message)) &&
         recoverAboutQueryId(requestedQueryId)
-      ) return fetchCountry(username, { method, recoveredQueryId: true });
+      ) return fetchCountry(username, { method, recoveredQueryId: true, generation });
       return graphQlErrors?.length
         ? { found: false, retryable: false, reason: graphQlErrors.join("; "), unavailable, ...rateLimit }
         : { found: false, unavailable, ...rateLimit };
     } catch (error) {
+      if (generation !== dataGeneration || resetInProgress) return { cancelled: true };
       return {
         found: false,
         retryable: true,
@@ -2147,6 +2205,28 @@
   const withLookupRequestLock = (callback) => {
     return withExclusiveWebLock("localefence:location-request", callback);
   };
+  const getTweetAccount = (tweet) => {
+    const container = tweet?.querySelector?.('[data-testid="User-Name"]');
+    const profileLink = [...(container?.querySelectorAll?.('a[href^="/"]') || [])].find((link) =>
+      /^\/[A-Za-z0-9_]{1,15}\/?$/.test(link.getAttribute("href") || ""),
+    );
+    const username = profileLink?.getAttribute("href")?.match(/^\/([A-Za-z0-9_]{1,15})/)?.[1];
+    return { container, username };
+  };
+  const applyCountryToTargets = (targets, country, username) => {
+    const key = usernameKey(username);
+    targets.forEach(({ container, tweet }) => {
+      if (tweet?.isConnected === false) return;
+      const current = getTweetAccount(tweet);
+      if (current.container === container && usernameKey(current.username) === key) {
+        applyCountry(container, tweet, country, username);
+      } else {
+        container?.querySelector?.("[data-account-based-in]")?.remove();
+        applyPostVisibility(tweet, null);
+        handleTweet(tweet);
+      }
+    });
+  };
 
   const processQueue = async () => {
     if (processing) return;
@@ -2155,6 +2235,7 @@
     try {
       await hydrationReady;
       while (queue.length) {
+        if (resetInProgress) break;
         if (document.visibilityState === "hidden") break;
         const username = queue.shift();
         const key = usernameKey(username);
@@ -2163,9 +2244,7 @@
         const hasLookupRecord = lookupRecords.has(usernameKey(username));
         const cached = getCachedAccount(username);
         if (cached) {
-          targets.forEach(({ container, tweet }) => {
-            applyCountry(container, tweet, cached.country, username);
-          });
+          applyCountryToTargets(targets, cached.country, username);
           if (!cached.expired && !hasLookupRecord) {
             pending.delete(key);
             continue;
@@ -2174,14 +2253,14 @@
         const reusableResult = getReusableLookupResult(username, lookupRecords.get(key)?.enqueuedAt);
         if (reusableResult) {
           clearLookupRetry(username);
-          targets.forEach(({ container, tweet }) => {
-            applyCountry(container, tweet, reusableResult.country, username);
-          });
+          applyCountryToTargets(targets, reusableResult.country, username);
           resolveLookupRecord(username, reusableResult.country, targets, reusableResult.user);
           pending.delete(key);
           continue;
         }
+        const generation = dataGeneration;
         const result = await withLookupRequestLock(async () => {
+          if (generation !== dataGeneration || resetInProgress) return { cancelled: true };
           syncLookupBackoffUntil();
           const backoffDelay = lookupBackoffUntil - Date.now();
           const waitTime = Math.max(backoffDelay, 0);
@@ -2195,9 +2274,9 @@
           if (sharedResult) return sharedResult;
           if (isUnavailableAccount(username)) return { found: false, unavailable: true };
           updateLookupRecord(username, { status: "checking" });
-          return fetchCountry(username);
+          return fetchCountry(username, { generation });
         });
-        if (result.cancelled) continue;
+        if (generation !== dataGeneration || resetInProgress || result.cancelled) continue;
         if (result.deferred) {
           queue.unshift(username);
           nextQueueDelay = Math.max(result.retryAfterMs, 250);
@@ -2211,9 +2290,7 @@
           clearLookupRetry(username);
           if (!lookupRetryTimers.size && !lookupBackoffUntil) setLookupStatus();
           renderLocationStats();
-          targets.forEach(({ container, tweet }) => {
-            applyCountry(container, tweet, result.country, username);
-          });
+          applyCountryToTargets(targets, result.country, username);
           resolveLookupRecord(username, result.country, targets, result.user);
           pending.delete(key);
         } else if (result.retryable) {
@@ -2238,22 +2315,27 @@
       }
     } finally {
       processing = false;
-      if (queue.length && document.visibilityState !== "hidden") scheduleQueue(nextQueueDelay);
+      if (!resetInProgress && queue.length && document.visibilityState !== "hidden") scheduleQueue(nextQueueDelay);
     }
   };
 
   const enqueue = (username, container, tweet) => {
+    if (resetInProgress) return;
     const key = usernameKey(username);
     if (!key) return;
-    if (isUnavailableAccount(username)) return;
+    const unavailable = isUnavailableAccount(username);
     const cached = getCachedAccount(username);
     const existingBadge = container?.querySelector?.("[data-account-based-in]");
     if (
       existingBadge &&
-      (!cached || usernameKey(existingBadge.dataset.accountUsername) !== key)
+      (unavailable || !cached || usernameKey(existingBadge.dataset.accountUsername) !== key)
     ) {
       existingBadge.remove();
       applyPostVisibility(tweet, null);
+    }
+    if (unavailable) {
+      applyPostVisibility(tweet, null);
+      return;
     }
     if (cached) {
       applyCountry(container, tweet, cached.country, username);
@@ -2293,8 +2375,16 @@
   };
   const refreshProcessedAccounts = () => {
     document.querySelectorAll("[data-account-based-in]").forEach((node) => {
-      const country = node.dataset.accountBasedIn;
       const tweet = node.closest('[data-testid="tweet"]');
+      const current = getTweetAccount(tweet);
+      if (current.container !== node.parentElement ||
+          usernameKey(current.username) !== usernameKey(node.dataset.accountUsername)) {
+        node.remove();
+        applyPostVisibility(tweet, null);
+        if (current.username) enqueue(current.username, current.container, tweet);
+        return;
+      }
+      const country = node.dataset.accountBasedIn;
       applyPostVisibility(tweet, country);
       enqueue(node.dataset.accountUsername, node.parentElement, tweet);
     });
@@ -2324,12 +2414,12 @@
   };
 
   const handleTweet = (tweet) => {
-    const container = tweet.querySelector('[data-testid="User-Name"]');
-    const profileLink = [...(container?.querySelectorAll?.('a[href^="/"]') || [])].find((link) =>
-      /^\/[A-Za-z0-9_]{1,15}\/?$/.test(link.getAttribute("href") || ""),
-    );
-    const username = profileLink?.getAttribute("href")?.match(/^\/([A-Za-z0-9_]{1,15})/)?.[1];
-    if (!username) return;
+    const { container, username } = getTweetAccount(tweet);
+    if (!username) {
+      tweet?.querySelector?.("[data-account-based-in]")?.remove();
+      applyPostVisibility(tweet, null);
+      return;
+    }
     enqueue(username, container, tweet);
   };
 
@@ -4399,7 +4489,29 @@
     let runtimeWasRemoved = false;
     let needsMountCheck = false;
     let maybeDrawer = false;
-    for (const { addedNodes, removedNodes } of mutations) {
+    const changedTweets = new Set();
+    for (const { addedNodes, removedNodes, target, type } of mutations) {
+      if (isLocaleFenceOwnedNode(target)) continue;
+      if (type === "attributes") {
+        if (target?.matches?.("a") && target.closest?.('[data-testid="User-Name"]')) {
+          const tweet = target.closest('[data-testid="tweet"]');
+          if (tweet) changedTweets.add(tweet);
+        }
+        continue;
+      }
+      const changedNodes = [...addedNodes, ...removedNodes];
+      const authorHeader = target?.closest?.('[data-testid="User-Name"]');
+      const insideBadge = target?.closest?.("[data-account-based-in]");
+      const authorChanged = !insideBadge && (
+        (authorHeader && changedNodes.some((node) => node?.nodeType === 1 &&
+          !node.matches?.("[data-account-based-in]"))) ||
+        changedNodes.some((node) => node?.matches?.('[data-testid="User-Name"]') ||
+          node?.querySelector?.('[data-testid="User-Name"]'))
+      );
+      if (authorChanged) {
+        const tweet = target?.closest?.('[data-testid="tweet"]');
+        if (tweet) changedTweets.add(tweet);
+      }
       for (const node of removedNodes) {
         const lostOverlay = node?.matches?.("[data-localefence-overlay]") ||
           node?.querySelector?.("[data-localefence-overlay]");
@@ -4431,11 +4543,12 @@
         else if (node.matches?.("a[href]") || node.querySelector?.("a[href]")) maybeDrawer = true;
       }
     }
+    changedTweets.forEach(handleTweet);
     if (needsMountCheck) tryMountLocaleFence(document);
     else if (runtimeWasRemoved) {
       ensureLocaleFenceStyles();
       tryMountLocaleFence(document, true);
     }
     if (maybeDrawer) maybeEnsureLocaleFenceDrawerEntry();
-  }).observe(document, { childList: true, subtree: true });
+  }).observe(document, { attributes: true, attributeFilter: ["href"], childList: true, subtree: true });
 })();

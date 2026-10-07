@@ -13,6 +13,7 @@ const instrumentedSource = source.replace(
     getBlockEnabled: () => blockEnabled,
     getBlockPaused: () => blockPaused,
     getBlockQueue: () => blockQueue.map(({ restId, username }) => ({ restId, username })),
+    getHydrationReady: () => hydrationReady,
     getCachedAccount,
     getAboutQueryId: () => aboutQueryId,
     getLookupBackoffUntil: () => lookupBackoffUntil,
@@ -29,6 +30,7 @@ const instrumentedSource = source.replace(
     rowForLocaleFenceDrawerAnchor,
     enqueueBlock,
     fetchCountry,
+    sendBlockRequest,
     isKnownBlocked,
     isCompactLocaleFenceNav,
     isHorizontalLocaleFenceNav,
@@ -41,6 +43,7 @@ const instrumentedSource = source.replace(
     rememberUnavailableAccount,
     removeLookupRecord,
     resetLocaleFenceData,
+    retryLookupRecord,
     resolveLocaleFenceMount,
     resolveCountryAlias,
     scheduleLookupRetry,
@@ -56,13 +59,20 @@ const instrumentedSource = source.replace(
 
 const boot = ({
   currentOwner,
+  feedTweets = [],
   fetchImpl,
+  indexedDBImpl,
   navigatorImpl,
   runtimeDataset,
+  storageBus,
+  storageDelivery = (callback) => callback(),
   storageValues,
   storedBlockEnabled = "true",
   storedBlockedAccounts,
   storedOwner,
+  setTimeoutImpl = setTimeout,
+  clearTimeoutImpl = clearTimeout,
+  visibilityState = "visible",
 }) => {
   const values = storageValues || new Map();
   const defaults = [
@@ -76,6 +86,15 @@ const boot = ({
     if (!values.has(key)) values.set(key, value);
   });
   const listeners = new Map();
+  const mutationObservers = [];
+  const storageListener = (event) => listeners.get("storage")?.(event);
+  if (storageBus) storageBus.push(storageListener);
+  const publishStorage = (key, oldValue, newValue) => {
+    if (oldValue === newValue) return;
+    storageBus?.forEach((listener) => {
+      if (listener !== storageListener) storageDelivery(() => listener({ key, oldValue, newValue }));
+    });
+  };
   const makeNode = () => ({
     append() {},
     appendChild() {},
@@ -98,12 +117,15 @@ const boot = ({
     createElement: makeNode,
     documentElement,
     head: makeNode(),
+    nodeType: 9,
     querySelector() { return null; },
-    querySelectorAll() { return []; },
+    querySelectorAll(selector) { return selector === '[data-testid="tweet"]' ? feedTweets : []; },
     readyState: "complete",
+    visibilityState,
   };
   const context = {
-    clearTimeout,
+    AbortController,
+    clearTimeout: clearTimeoutImpl,
     console,
     document,
     getComputedStyle: () => ({ color: "rgb(15, 20, 25)", display: "block" }),
@@ -112,16 +134,33 @@ const boot = ({
       getItem: (key) => values.get(key) ?? null,
       key: (index) => [...values.keys()][index] ?? null,
       get length() { return values.size; },
-      removeItem: (key) => values.delete(key),
-      setItem: (key, value) => values.set(key, String(value)),
+      removeItem: (key) => {
+        const oldValue = values.get(key) ?? null;
+        values.delete(key);
+        publishStorage(key, oldValue, null);
+      },
+      setItem: (key, value) => {
+        const oldValue = values.get(key) ?? null;
+        const newValue = String(value);
+        values.set(key, newValue);
+        publishStorage(key, oldValue, newValue);
+      },
     },
-    MutationObserver: class { observe() {} },
+    MutationObserver: class {
+      constructor(callback) { this.callback = callback; }
+      observe(target, options) {
+        this.target = target;
+        this.options = options;
+        mutationObservers.push(this);
+      }
+    },
     requestAnimationFrame: (callback) => callback(),
-    setTimeout,
+    setTimeout: setTimeoutImpl,
     URL,
     URLSearchParams,
   };
   if (navigatorImpl) context.navigator = navigatorImpl;
+  if (indexedDBImpl) context.indexedDB = indexedDBImpl;
   if (fetchImpl) context.fetch = fetchImpl;
   context.globalThis = context;
   context.addEventListener = (type, listener) => listeners.set(type, listener);
@@ -130,11 +169,26 @@ const boot = ({
     blockEnabled: () => context.__localefenceTest.getBlockEnabled(),
     hooks: context.__localefenceTest,
     runtime: () => documentElement.dataset.localefenceRuntime,
+    setOwner: (restId) => {
+      document.cookie = `twid=${encodeURIComponent(`u=${restId}`)}; ct0=test-csrf`;
+    },
+    mutate: (mutations) => {
+      mutationObservers.filter((observer) => observer.target === document)
+        .forEach((observer) => {
+          const observed = mutations.filter((mutation) =>
+            mutation.type === "attributes"
+              ? observer.options.attributes && observer.options.attributeFilter?.includes(mutation.attributeName)
+              : observer.options.childList,
+          );
+          if (observed.length) observer.callback(observed);
+        });
+    },
     stored: (key) => values.get(key) ?? null,
+    dispatchStorage: (event) => storageListener(event),
     storage: (key, newValue) => {
-      if (newValue == null) values.delete(key);
-      else values.set(key, String(newValue));
-      listeners.get("storage")({ key, newValue });
+      if (newValue == null) context.localStorage.removeItem(key);
+      else context.localStorage.setItem(key, newValue);
+      storageListener({ key, newValue });
     },
   };
 };
@@ -164,6 +218,40 @@ const waitFor = async (predicate) => {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   assert.fail("Timed out waiting for LocaleFence's asynchronous queue");
+};
+
+const makeMutableFeedTarget = (initialAuthor) => {
+  let author = initialAuthor;
+  let badge = null;
+  const cell = { dataset: {} };
+  const link = {
+    nodeType: 1,
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    getAttribute: (name) => name === "href" ? `/${author}` : null,
+    matches: (selector) => selector === "a" || selector === "a[href]",
+    closest: (selector) => selector === '[data-testid="User-Name"]' ? container
+      : selector === '[data-testid="tweet"]' ? tweet : null,
+  };
+  const container = {
+    closest: (selector) => selector === '[data-testid="User-Name"]' ? container
+      : selector === '[data-testid="tweet"]' ? tweet : null,
+    appendChild(node) {
+      badge = node;
+      node.parentElement = container;
+      node.remove = () => { badge = null; };
+    },
+    querySelector: (selector) => selector === "[data-account-based-in]" ? badge : null,
+    querySelectorAll: (selector) => selector === 'a[href^="/"]' ? [link] : [],
+  };
+  const tweet = {
+    isConnected: true,
+    closest: (selector) => selector === '[data-testid="cellInnerDiv"]' ? cell
+      : selector === '[data-testid="tweet"]' ? tweet : null,
+    querySelector: (selector) => selector === '[data-testid="User-Name"]' ? container
+      : selector === "[data-account-based-in]" ? badge : null,
+  };
+  return { cell, container, getBadge: () => badge, link, setAuthor: (next) => { author = next; }, tweet };
 };
 
 const testImmediateNormalLookups = async () => {
@@ -221,8 +309,9 @@ const testAndroidMountRecovery = () => {
     runtimeDataset: { localefenceRuntime: "1.2.1" },
     storedBlockEnabled: "false",
   });
-  assert.equal(app.runtime(), "1.2.5", "a stale mobile-tab marker must not prevent reinjection");
-  assert.equal(app.hooks.getRuntimeVersion(), "1.2.5");
+  const version = require("./package.json").version;
+  assert.equal(app.runtime(), version, "a stale mobile-tab marker must not prevent reinjection");
+  assert.equal(app.hooks.getRuntimeVersion(), version);
   const body = {};
   assert.equal(
     app.hooks.resolveLocaleFenceMount({
@@ -828,6 +917,323 @@ const testFreshIdentityAndDurableDeduplication = async () => {
   assert.deepEqual(blockedRestIds, ["2"], "a confirmed block must not be repeated after it is remembered");
 };
 
+const testQueuedLookupDoesNotCrossOwners = async () => {
+  const blockedRestIds = [];
+  const fetchImpl = async (url, options) => {
+    if (url.includes("AboutAccountQuery")) {
+      const { screenName } = JSON.parse(new URL(url).searchParams.get("variables"));
+      return {
+        headers: { get: () => null }, ok: true, status: 200,
+        json: async () => ({ data: { user_result_by_screen_name: { result: {
+          rest_id: screenName === "Alice" ? "9" : "10",
+          core: { name: screenName, screen_name: screenName },
+          about_profile: { account_based_in: "Italy" },
+        } } } }),
+      };
+    }
+    if (url.includes("blocks/create.json")) {
+      const restId = new URLSearchParams(options.body).get("user_id");
+      blockedRestIds.push(restId);
+      return { json: async () => ({ id_str: restId }), ok: true, status: 200 };
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  const app = boot({ currentOwner: "1", fetchImpl, storedBlockEnabled: "false", storedOwner: "1" });
+  app.hooks.rememberLookupRecord("Alice", { tweetText: "Old feed post", tweetUrl: "" });
+  assert.equal(app.hooks.getLookupRecord("Alice").ownerRestId, "1");
+  app.setOwner("2");
+  app.storage("localefence.blockOwnerRestId", "2");
+  app.storage("localefence.blockEnabled", "true");
+  app.hooks.retryLookupRecord("alice");
+  await waitFor(() => app.hooks.getLookupRecord("Alice") == null);
+  assert.deepEqual(blockedRestIds, [], "an old owner's queue entry must not block under the new owner");
+
+  app.hooks.rememberLookupRecord("Bob", { tweetText: "New feed post", tweetUrl: "" });
+  app.hooks.retryLookupRecord("bob");
+  await waitFor(() => blockedRestIds.length === 1);
+  assert.deepEqual(blockedRestIds, ["10"], "the new owner's queue entry should still block normally");
+};
+
+const testAccountSwitchDuringLookupDisablesBlocking = async () => {
+  let finishLookup;
+  const blockedRestIds = [];
+  const fetchImpl = (url, options) => {
+    if (url.includes("AboutAccountQuery")) return new Promise((resolve) => {
+      finishLookup = () => resolve({
+        headers: { get: () => null }, ok: true, status: 200,
+        json: async () => ({ data: { user_result_by_screen_name: { result: {
+          rest_id: "2", core: { name: "Alice", screen_name: "Alice" },
+          about_profile: { account_based_in: "Italy" },
+        } } } }),
+      });
+    });
+    if (url.includes("blocks/create.json")) {
+      blockedRestIds.push(new URLSearchParams(options.body).get("user_id"));
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  const app = boot({ currentOwner: "1", fetchImpl, storedOwner: "1" });
+  const target = makeMutableFeedTarget("Alice");
+  app.hooks.enqueue("Alice", target.container, target.tweet);
+  await waitFor(() => Boolean(finishLookup));
+  app.setOwner("2");
+  finishLookup();
+  await waitFor(() => app.hooks.getLookupRecord("Alice") == null);
+  assert.equal(app.blockEnabled(), false);
+  assert.deepEqual(blockedRestIds, []);
+};
+
+const testChangedTweetDoesNotReceiveOldCountry = async () => {
+  const releases = new Map();
+  const fetchImpl = (url) => {
+    const { screenName } = JSON.parse(new URL(url).searchParams.get("variables"));
+    return new Promise((resolve) => {
+      releases.set(screenName, () => resolve({
+        headers: { get: () => null }, ok: true, status: 200,
+        json: async () => ({ data: { user_result_by_screen_name: { result: {
+          rest_id: screenName === "Alice" ? "2" : "3",
+          core: { name: screenName, screen_name: screenName },
+          about_profile: { account_based_in: screenName === "Alice" ? "Italy" : "France" },
+        } } } }),
+      }));
+    });
+  };
+  const app = boot({ currentOwner: "1", fetchImpl, storedBlockEnabled: "false" });
+  const target = makeMutableFeedTarget("Alice");
+  app.hooks.enqueue("Alice", target.container, target.tweet);
+  await waitFor(() => releases.has("Alice"));
+  target.setAuthor("Bob");
+  releases.get("Alice")();
+  await waitFor(() => releases.has("Bob"));
+  assert.equal(target.cell.dataset.localefenceHidden, undefined);
+  assert.notEqual(target.getBadge()?.dataset.accountUsername, "Alice");
+  releases.get("Bob")();
+  await waitFor(() => target.getBadge()?.dataset.accountUsername === "Bob");
+  assert.equal(target.getBadge().dataset.accountBasedIn, "France");
+  assert.equal(target.cell.dataset.localefenceHidden, undefined);
+};
+
+const testAuthorLinkMutationClearsStaleBadge = async () => {
+  const app = boot({
+    currentOwner: "1",
+    fetchImpl: async () => ({
+      headers: { get: () => null }, ok: true, status: 200,
+      json: async () => ({ data: { user_result_by_screen_name: { result: {
+        rest_id: "3", core: { name: "Bob", screen_name: "Bob" },
+        about_profile: { account_based_in: "France" },
+      } } } }),
+    }),
+    storedBlockEnabled: "false",
+  });
+  app.hooks.seedCachedUser({
+    restId: "2", screenName: "Alice", name: "Alice", country: "Italy", updatedAt: Date.now(),
+  });
+  const target = makeMutableFeedTarget("Alice");
+  app.hooks.enqueue("Alice", target.container, target.tweet);
+  assert.equal(target.cell.dataset.localefenceHidden, "true");
+  target.setAuthor("Bob");
+  app.mutate([{ type: "attributes", attributeName: "href", target: target.link, addedNodes: [], removedNodes: [] }]);
+  assert.equal(target.cell.dataset.localefenceHidden, undefined);
+  assert.notEqual(target.getBadge()?.dataset.accountUsername, "Alice");
+  await waitFor(() => target.getBadge()?.dataset.accountUsername === "Bob");
+};
+
+const testUnavailableAuthorMutationClearsStaleBadge = async () => {
+  const app = boot({ currentOwner: "1", storedBlockEnabled: "false" });
+  await app.hooks.getHydrationReady();
+  app.hooks.seedCachedUser({
+    restId: "2", screenName: "Alice", name: "Alice", country: "Italy", updatedAt: Date.now(),
+  });
+  app.hooks.rememberUnavailableAccount("MissingUser");
+  const target = makeMutableFeedTarget("Alice");
+  app.hooks.enqueue("Alice", target.container, target.tweet);
+  assert.equal(target.cell.dataset.localefenceHidden, "true");
+  target.setAuthor("MissingUser");
+  app.mutate([{ type: "attributes", attributeName: "href", target: target.link, addedNodes: [], removedNodes: [] }]);
+  assert.equal(target.getBadge(), null, "an unavailable author must not inherit the previous author's flag");
+  assert.equal(target.cell.dataset.localefenceHidden, undefined);
+  assert.equal(app.hooks.getLookupRecord("MissingUser"), undefined);
+};
+
+const testAuthorChildMutationClearsStaleBadge = async () => {
+  let lookups = 0;
+  const app = boot({ currentOwner: "1", storedBlockEnabled: "false", fetchImpl: async () => {
+    lookups += 1;
+    return {
+      headers: { get: () => null }, ok: true, status: 200,
+      json: async () => ({ data: { user_result_by_screen_name: { result: {
+        rest_id: "3", core: { name: "Bob", screen_name: "Bob" },
+        about_profile: { account_based_in: "France" },
+      } } } }),
+    };
+  } });
+  await app.hooks.getHydrationReady();
+  app.hooks.seedCachedUser({
+    restId: "2", screenName: "Alice", name: "Alice", country: "Italy", updatedAt: Date.now(),
+  });
+  const target = makeMutableFeedTarget("Alice");
+  app.hooks.enqueue("Alice", target.container, target.tweet);
+  assert.equal(target.cell.dataset.localefenceHidden, "true");
+  target.setAuthor("Bob");
+  app.mutate([{ type: "childList", target: target.container, addedNodes: [target.link], removedNodes: [] }]);
+  assert.equal(target.getBadge(), null);
+  assert.equal(target.cell.dataset.localefenceHidden, undefined);
+  await waitFor(() => target.getBadge()?.dataset.accountUsername === "Bob");
+  assert.equal(target.getBadge().dataset.accountBasedIn, "France");
+  assert.equal(lookups, 1);
+
+  // LocaleFence's own badge render must not rescan the author or restart a lookup.
+  let authorScans = 0;
+  const queryLinks = target.container.querySelectorAll;
+  target.container.querySelectorAll = (selector) => { authorScans += 1; return queryLinks(selector); };
+  const badge = target.getBadge();
+  badge.nodeType = 1;
+  badge.matches = (selector) => selector === "[data-account-based-in]";
+  badge.closest = (selector) => selector === "[data-account-based-in]" ? badge
+    : target.container.closest(selector);
+  app.mutate([{ type: "childList", target: target.container, addedNodes: [badge], removedNodes: [] }]);
+  app.mutate([{ type: "childList", target: badge, addedNodes: [target.link], removedNodes: [] }]);
+  assert.equal(authorScans, 0);
+};
+
+const makeRequestTimeouts = () => {
+  const timers = new Map();
+  return {
+    setTimeoutImpl(callback, delay) {
+      if (delay !== 20000) return setTimeout(callback, delay);
+      const token = {};
+      timers.set(token, callback);
+      return token;
+    },
+    clearTimeoutImpl(token) {
+      if (!timers.delete(token)) clearTimeout(token);
+    },
+    expire() {
+      assert.equal(timers.size, 1, "the request timeout must remain active while the body is read");
+      timers.values().next().value();
+    },
+    size: () => timers.size,
+  };
+};
+
+const testReplacedAuthorHeaderClearsStaleVisibility = async () => {
+  const app = boot({ currentOwner: "1", storedBlockEnabled: "false" });
+  await app.hooks.getHydrationReady();
+  app.hooks.seedCachedUser({ restId: "2", screenName: "Alice", country: "Italy", updatedAt: Date.now() });
+  app.hooks.seedCachedUser({ restId: "3", screenName: "Bob", country: "France", updatedAt: Date.now() });
+  const target = makeMutableFeedTarget("Alice");
+  app.hooks.enqueue("Alice", target.container, target.tweet);
+  assert.equal(target.cell.dataset.localefenceHidden, "true");
+  const replacement = makeMutableFeedTarget("Bob");
+  replacement.container.nodeType = 1;
+  replacement.container.matches = (selector) => selector === '[data-testid="User-Name"]';
+  target.tweet.querySelector = (selector) => selector === '[data-testid="User-Name"]' ? replacement.container : null;
+  app.mutate([{ type: "childList", target: target.tweet,
+    addedNodes: [replacement.container], removedNodes: [target.container] }]);
+  assert.equal(target.cell.dataset.localefenceHidden, undefined);
+  assert.equal(replacement.getBadge().dataset.accountUsername, "Bob");
+};
+
+const testResponseBodiesRemainBoundedByTimeout = async () => {
+  const timeouts = makeRequestTimeouts();
+  let readingBody = false;
+  let signal;
+  const app = boot({ currentOwner: "1", storedOwner: "1", ...timeouts,
+    fetchImpl: async (_url, options) => {
+      signal = options.signal;
+      return { headers: { get: () => null }, ok: true, status: 200,
+        json: () => { readingBody = true; return new Promise(() => {}); },
+      };
+    },
+  });
+  const lookup = app.hooks.fetchCountry("Alice");
+  await waitFor(() => readingBody);
+  timeouts.expire();
+  assert.equal((await lookup).reason, "timeout");
+  assert.equal(signal.aborted, true);
+  assert.equal(timeouts.size(), 0);
+
+  readingBody = false;
+  const block = app.hooks.sendBlockRequest("2", "https://x.com/i/api/1.1/blocks/create.json");
+  const failedBlock = assert.rejects(block, /timed out; its result is unknown/);
+  await waitFor(() => readingBody);
+  timeouts.expire();
+  await failedBlock;
+  assert.equal(signal.aborted, true);
+  assert.equal(timeouts.size(), 0);
+};
+
+const testResetReleasesStalledResponseBody = async () => {
+  let staleSignal;
+  let readingBody = false;
+  const app = boot({ currentOwner: "1", storedBlockEnabled: "false",
+    navigatorImpl: { locks: makeLockManager() },
+    fetchImpl: async (url, options) => {
+      const { screenName } = JSON.parse(new URL(url).searchParams.get("variables"));
+      if (screenName === "Alice") {
+        staleSignal = options.signal;
+        return { headers: { get: () => null }, ok: true, status: 200,
+          json: () => { readingBody = true; return new Promise(() => {}); },
+        };
+      }
+      return { headers: { get: () => null }, ok: true, status: 200,
+        json: async () => ({ data: { user_result_by_screen_name: { result: {
+          rest_id: "3", core: { name: "Bob", screen_name: "Bob" },
+          about_profile: { account_based_in: "France" },
+        } } } }),
+      };
+    },
+  });
+  const alice = makeMutableFeedTarget("Alice");
+  app.hooks.enqueue("Alice", alice.container, alice.tweet);
+  await waitFor(() => readingBody);
+  await app.hooks.resetLocaleFenceData();
+  assert.equal(staleSignal.aborted, true);
+  const bob = makeMutableFeedTarget("Bob");
+  app.hooks.enqueue("Bob", bob.container, bob.tweet);
+  await waitFor(() => bob.getBadge()?.dataset.accountUsername === "Bob");
+  assert.equal(app.hooks.getCachedAccount("Alice"), null);
+};
+
+const testDelayedStorageDoesNotResumePause = async () => {
+  const storageValues = new Map([
+    ["localefence.blockEnabled", "false"], ["localefence.blockOwnerRestId", "1"],
+    ["localefence.locations", "Italy"], ["localefence.notificationsEnabled", "false"],
+    ["localefence.blockPaused", "false"],
+  ]);
+  const events = [];
+  const storageBus = [];
+  let blockRequests = 0;
+  const fetchImpl = async (url) => {
+    if (url.includes("AboutAccountQuery")) return {
+      headers: { get: () => null }, ok: true, status: 200,
+      json: async () => ({ data: { user_result_by_screen_name: { result: {
+        rest_id: "9", core: { name: "Alice", screen_name: "Alice" },
+        about_profile: { account_based_in: "Italy" },
+      } } } }),
+    };
+    blockRequests += 1;
+    throw new Error("A block request failed");
+  };
+  const options = { currentOwner: "1", storedOwner: "1", storedBlockEnabled: "false", storageValues,
+    storageBus, storageDelivery: (callback) => events.push(callback), fetchImpl };
+  const first = boot(options);
+  const second = boot(options);
+  await Promise.all([first.hooks.getHydrationReady(), second.hooks.getHydrationReady()]);
+  first.storage("localefence.blockEnabled", "true");
+  const target = makeMutableFeedTarget("Alice");
+  first.hooks.enqueue("Alice", target.container, target.tweet);
+  await waitFor(() => first.hooks.getBlockPaused());
+  assert.equal(blockRequests, 1);
+  while (events.length) events.shift()();
+  first.dispatchStorage({ key: "localefence.blockPaused", newValue: "false" });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(first.hooks.getBlockPaused(), true);
+  assert.equal(second.hooks.getBlockPaused(), true);
+  assert.equal(storageValues.get("localefence.blockPaused"), "true");
+  assert.equal(blockRequests, 1, "a delayed enable or unpause event must not retry the failed block");
+};
+
 const testQueryIdRecovery = async () => {
   const oldQueryId = "OldAboutQueryId123456";
   const storageValues = new Map([
@@ -1266,6 +1672,85 @@ const testCompleteReset = async () => {
   assert.equal(values.get("unrelated.setting"), "keep me");
 };
 
+const testResetCancelsInFlightLookup = async () => {
+  let finishLookup;
+  const fetchImpl = () => new Promise((resolve) => {
+    finishLookup = () => resolve({
+      headers: { get: () => null }, ok: true, status: 200,
+      json: async () => ({ data: { user_result_by_screen_name: { result: {
+        rest_id: "2", core: { name: "Alice", screen_name: "Alice" },
+        about_profile: { account_based_in: "Italy" },
+      } } } }),
+    });
+  });
+  const app = boot({ currentOwner: "1", fetchImpl, storedBlockEnabled: "false" });
+  const target = makeMutableFeedTarget("Alice");
+  app.hooks.enqueue("Alice", target.container, target.tweet);
+  await waitFor(() => Boolean(finishLookup));
+  await app.hooks.resetLocaleFenceData();
+  finishLookup();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(app.stored("localefence.sharedLookupCache"), null);
+  assert.equal(app.hooks.getCachedAccount("Alice"), null);
+  assert.equal(target.cell.dataset.localefenceHidden, undefined);
+};
+
+const testResetDoesNotRestoreInFlightBlockData = async () => {
+  let finishBlock;
+  const fetchImpl = () => new Promise((resolve) => {
+    finishBlock = () => resolve({
+      json: async () => ({ id_str: "2" }), ok: true, status: 200,
+    });
+  });
+  const app = boot({ currentOwner: "1", fetchImpl, storedOwner: "1" });
+  queueVerifiedBlock(app, {
+    restId: "2", screenName: "Alice", name: "Alice", country: "Italy", updatedAt: Date.now(),
+  });
+  await waitFor(() => Boolean(finishBlock));
+  await app.hooks.resetLocaleFenceData();
+  finishBlock();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(app.stored("localefence.blockedAccounts"), null);
+  assert.equal(app.stored("localefence.totalBlocked"), null);
+  assert.equal(app.stored("localefence.blockPaused"), null);
+};
+
+const testResetCancelsAnotherTabsInFlightLookup = async () => {
+  const storageValues = new Map();
+  const storageBus = [];
+  const feedTweets = [];
+  const firstTab = boot({
+    currentOwner: "1", storageBus, storageValues, storedBlockEnabled: "false",
+  });
+  let finishLookup;
+  let lookupCount = 0;
+  const secondTab = boot({
+    currentOwner: "1", feedTweets, storageBus, storageValues, storedBlockEnabled: "false",
+    fetchImpl: () => new Promise((resolve) => {
+      lookupCount += 1;
+      finishLookup = () => resolve({
+        headers: { get: () => null }, ok: true, status: 200,
+        json: async () => ({ data: { user_result_by_screen_name: { result: {
+          rest_id: "2", core: { name: "Alice", screen_name: "Alice" },
+          about_profile: { account_based_in: "Italy" },
+        } } } }),
+      });
+    }),
+  });
+  const target = makeMutableFeedTarget("Alice");
+  feedTweets.push(target.tweet);
+  secondTab.hooks.enqueue("Alice", target.container, target.tweet);
+  await waitFor(() => Boolean(finishLookup));
+  await firstTab.hooks.resetLocaleFenceData();
+  await waitFor(() => secondTab.hooks.getLookupRecord("Alice") == null);
+  finishLookup();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(storageValues.get("localefence.sharedLookupCache"), undefined);
+  assert.equal(secondTab.hooks.getCachedAccount("Alice"), null);
+  assert.equal(lookupCount, 1, "reset must not immediately rescan the old feed in another tab");
+  assert.equal([...storageValues.keys()].some((key) => key.startsWith("localefence.")), false);
+};
+
 const run = async () => {
   testAndroidMountRecovery();
   testDrawerEntry();
@@ -1285,17 +1770,33 @@ const run = async () => {
   await testNonRateLimitErrorIgnoresQuotaReset();
   await testImmediateNormalLookups();
   await testFreshIdentityAndDurableDeduplication();
+  await testQueuedLookupDoesNotCrossOwners();
+  await testAccountSwitchDuringLookupDisablesBlocking();
+  await testChangedTweetDoesNotReceiveOldCountry();
+  await testAuthorLinkMutationClearsStaleBadge();
+  await testUnavailableAuthorMutationClearsStaleBadge();
+  await testAuthorChildMutationClearsStaleBadge();
+  await testReplacedAuthorHeaderClearsStaleVisibility();
+  await testResponseBodiesRemainBoundedByTimeout();
+  await testResetReleasesStalledResponseBody();
+  await testDelayedStorageDoesNotResumePause();
   await testImmediateNormalBlocks();
   await testQueuedBlockCancellation();
   await testFirefoxForeignLockPromise();
   await testConcurrentTabDeduplication();
   await testPausedStateAndOwnedVisibility();
   await testCompleteReset();
+  await testResetCancelsInFlightLookup();
+  await testResetDoesNotRestoreInFlightBlockData();
+  await testResetCancelsAnotherTabsInFlightLookup();
 };
 
-run()
-  .then(() => console.log("LocaleFence safety and lifecycle checks passed"))
-  .catch((error) => {
-    console.error(error);
-    process.exitCode = 1;
-  });
+module.exports = { boot, makeMutableFeedTarget, waitFor };
+if (require.main === module) {
+  run()
+    .then(() => console.log("LocaleFence safety and lifecycle checks passed"))
+    .catch((error) => {
+      console.error(error);
+      process.exitCode = 1;
+    });
+}
