@@ -15,6 +15,7 @@ const userscriptVersion = source.match(/^\/\/ @version\s+(\S+)$/m)?.[1];
 const runtimeVersion = source.match(/const runtimeVersion = "([^"]+)"/)?.[1];
 
 assert.equal(manifest.manifest_version, 3);
+assert.equal(firefoxManifest.manifest_version, 3);
 assert.equal(userscriptName, "LocaleFence for X", "userscript @name is part of its update identity");
 assert.equal(
   userscriptNamespace,
@@ -22,19 +23,26 @@ assert.equal(
   "userscript @namespace is part of its update identity",
 );
 assert.equal(manifest.name, "LocaleFence - Country Filter for X");
+assert.equal(firefoxManifest.name, manifest.name);
+assert.equal(firefoxManifest.description, manifest.description);
 assert.equal(manifest.version, userscriptVersion, "manifest and userscript versions must match");
 assert.equal(firefoxManifest.version, userscriptVersion, "Firefox and userscript versions must match");
 assert.equal(packageJson.version, userscriptVersion, "package and userscript versions must match");
 assert.equal(runtimeVersion, userscriptVersion, "runtime marker and userscript versions must match");
 assert.ok(manifest.name.length <= 45, "Chrome extension names are limited to 45 characters");
 assert.ok(manifest.description.length <= 132, "Chrome extension descriptions are limited to 132 characters");
+assert.ok(Number(manifest.minimum_chrome_version) >= 105, "minimum_chrome_version must cover CSS :has()");
 assert.deepEqual(manifest.content_scripts?.[0]?.matches, ["https://x.com/*"]);
 assert.equal(manifest.permissions, undefined, "do not add extension permissions without a current need");
+assert.equal(firefoxManifest.permissions, undefined, "do not add Firefox permissions without a current need");
 assert.deepEqual(firefoxManifest.content_scripts?.[0]?.matches, ["https://x.com/*"]);
 assert.match(firefoxManifest.browser_specific_settings?.gecko?.id || "", /@/);
 assert.ok(firefoxManifest.browser_specific_settings?.gecko_android?.strict_min_version);
 
-for (const relativePath of Object.values(manifest.icons)) {
+for (const relativePath of new Set([
+  ...Object.values(manifest.icons || {}),
+  ...Object.values(firefoxManifest.icons || {}),
+])) {
   await readFile(new URL(`../${relativePath}`, import.meta.url));
 }
 

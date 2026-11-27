@@ -11,11 +11,21 @@ const instrumentedSource = source.replace(
   `
   globalThis.__localefenceTest = {
     getBlockEnabled: () => blockEnabled,
+    getBlockHistory: () => blockHistory.map((entry) => ({ ...entry })),
     getBlockPaused: () => blockPaused,
     getBlockQueue: () => blockQueue.map(({ restId, username }) => ({ restId, username })),
     getHydrationReady: () => hydrationReady,
+    getTotalBlockedCount: () => totalBlockedCount,
     getCachedAccount,
+    getLocationStats,
+    getLocationCount,
+    getSelectedAccountCount,
+    getMatchStoreRegion: () => matchStoreRegion,
     getAboutQueryId: () => aboutQueryId,
+    extractAboutQueryId,
+    rememberAboutQueryId,
+    extractSourceCountry,
+    matchAccountLocation,
     getLookupBackoffUntil: () => lookupBackoffUntil,
     getLookupRecord: (username) => lookupRecords.get(usernameKey(username)),
     getLookupQuota: () => lookupQuota,
@@ -23,10 +33,15 @@ const instrumentedSource = source.replace(
     getNotificationSize: () => notificationSize,
     getRuntimeVersion: () => runtimeVersion,
     getSelectedLocations: () => [...selectedLocations],
+    applyCountry,
     applyPostVisibility,
     buildLocaleFenceDrawerEntry,
+    clearBlockHistory,
+    clearCacheStores,
+    clearLookupRecords,
     findLocaleFenceDrawerAnchor,
     findTweets,
+    markFeedAccount,
     rowForLocaleFenceDrawerAnchor,
     enqueueBlock,
     fetchCountry,
@@ -35,6 +50,7 @@ const instrumentedSource = source.replace(
     isCompactLocaleFenceNav,
     isHorizontalLocaleFenceNav,
     isMobileLocaleFenceViewport,
+    isVerticalSidebarLocaleFenceNav,
     shouldUseDrawerLocaleFence,
     isUnavailableAccount,
     pauseBlocking,
@@ -50,7 +66,7 @@ const instrumentedSource = source.replace(
     withLookupRequestLock,
     enqueue,
     seedCachedUser: (user) => {
-      aboutUsers.set(user.restId, user);
+      aboutUsers.set(user.restId, { locationWarning: false, ...user });
       screenNames.set(user.screenName.toLowerCase(), user.restId);
     },
   };
@@ -97,15 +113,29 @@ const boot = ({
   };
   const makeNode = () => ({
     append() {},
-    appendChild() {},
+    appendChild(child) { this.children.push(child); return child; },
+    children: [],
+    attributes: {},
     closest() { return null; },
     dataset: {},
     isConnected: true,
-    matches() { return false; },
-    querySelector() { return null; },
+    matches(selector) {
+      if (selector === "[data-account-based-in]") return "accountBasedIn" in this.dataset;
+      if (selector === "[data-account-state]") return "accountState" in this.dataset;
+      return false;
+    },
+    querySelector(selector) {
+      if (selector === "[data-account-state]") {
+        return this.children.find((child) => child?.dataset?.accountState) || null;
+      }
+      return null;
+    },
     querySelectorAll() { return []; },
     remove() {},
-    setAttribute() {},
+    setAttribute(name, value) { this.attributes[name] = value; },
+    getAttribute(name) { return this.attributes[name] ?? null; },
+    set textContent(value) { this.children = []; this.text = value; },
+    get textContent() { return this.text || ""; },
     style: {},
   });
   const documentElement = makeNode();
@@ -119,7 +149,18 @@ const boot = ({
     head: makeNode(),
     nodeType: 9,
     querySelector() { return null; },
-    querySelectorAll(selector) { return selector === '[data-testid="tweet"]' ? feedTweets : []; },
+    querySelectorAll(selector) {
+      if (selector === '[data-testid="tweet"]') return feedTweets;
+      if (selector === "[data-account-based-in]" || selector === "[data-account-username]") {
+        return feedTweets.map((tweet) => tweet.querySelector("[data-account-based-in]")).filter(Boolean);
+      }
+      if (selector === "[data-localefence-hidden]") {
+        return feedTweets
+          .map((tweet) => tweet.closest?.('[data-testid="cellInnerDiv"]'))
+          .filter((cell) => cell?.dataset?.localefenceHidden);
+      }
+      return [];
+    },
     readyState: "complete",
     visibilityState,
   };
@@ -239,6 +280,7 @@ const makeMutableFeedTarget = (initialAuthor) => {
     appendChild(node) {
       badge = node;
       node.parentElement = container;
+      node.closest = (selector) => selector === "[data-account-based-in]" ? node : container.closest(selector);
       node.remove = () => { badge = null; };
     },
     querySelector: (selector) => selector === "[data-account-based-in]" ? badge : null,
@@ -394,6 +436,35 @@ const testAndroidMountRecovery = () => {
     app.hooks.shouldUseDrawerLocaleFence({ getBoundingClientRect: () => ({ width: 88, height: 600 }) }),
     false,
     "a vertical sidebar must keep the desktop entry styling",
+  );
+  assert.equal(
+    app.hooks.isVerticalSidebarLocaleFenceNav({ getBoundingClientRect: () => ({ width: 88, height: 600 }) }),
+    true,
+    "a measured vertical sidebar must pass positive sidebar verification",
+  );
+  assert.equal(
+    app.hooks.isVerticalSidebarLocaleFenceNav({ getBoundingClientRect: () => ({ width: 0, height: 0 }) }),
+    false,
+    "an unmeasured or display:contents nav must never receive a sidebar button",
+  );
+  const horizontalLinksNav = {
+    getBoundingClientRect: () => ({ width: 180, height: 140 }),
+    querySelectorAll: (selector) => selector === "a[href]"
+      ? [
+          { getBoundingClientRect: () => ({ left: 10, top: 700, width: 48, height: 48 }) },
+          { getBoundingClientRect: () => ({ left: 90, top: 700, width: 48, height: 48 }) },
+        ]
+      : [],
+  };
+  assert.equal(
+    app.hooks.shouldUseDrawerLocaleFence(horizontalLinksNav),
+    true,
+    "an experimental nav with side-by-side links must route to the drawer even when ratio <= 1.5",
+  );
+  assert.equal(
+    app.hooks.isVerticalSidebarLocaleFenceNav(horizontalLinksNav),
+    false,
+    "an experimental bottom bar must never mount a sidebar button",
   );
   assert.equal(app.hooks.isMobileLocaleFenceViewport(), false);
   assert.equal(
@@ -657,6 +728,15 @@ const testUiInteractionStyles = () => {
       `the notification position setting must include ${position}`,
     );
   }
+  assert.match(
+    source,
+    /<input data-match-store-region type="checkbox" role="switch">/,
+    "the Connected via store-region setting must be a labeled switch in the Settings tab",
+  );
+  assert.ok(
+    source.includes("Match Connected via store region"),
+    "the store-region switch must say what it matches instead of relying on an unlabeled control",
+  );
   assert.match(
     source,
     /\[data-localefence-trigger\]::before\s*\{[\s\S]*?background: currentColor;[\s\S]*?transition: opacity 0\.2s ease;/,
@@ -1278,32 +1358,39 @@ const testQueryIdRecovery = async () => {
 };
 
 const testPostTransportFallback = async () => {
-  const requestedMethods = [];
-  const fetchImpl = async (_url, options) => {
-    requestedMethods.push(options.method);
-    if (options.method === "POST") {
-      return { headers: { get: () => null }, ok: false, status: 405 };
-    }
-    return {
-      headers: { get: () => null },
-      json: () => Promise.resolve({
-        data: {
-          user_result_by_screen_name: {
-            result: {
-              rest_id: "2",
-              core: { name: "Alice", screen_name: "Alice" },
-              about_profile: { account_based_in: "Italy" },
+  for (const rejectStatus of [405, 422]) {
+    const requestedMethods = [];
+    const fetchImpl = async (_url, options) => {
+      requestedMethods.push(options.method);
+      if (options.method === "POST") {
+        return { headers: { get: () => null }, ok: false, status: rejectStatus };
+      }
+      return {
+        headers: { get: () => null },
+        json: () => Promise.resolve({
+          data: {
+            user_result_by_screen_name: {
+              result: {
+                rest_id: "2",
+                core: { name: "Alice", screen_name: "Alice" },
+                about_profile: { account_based_in: "Italy" },
+              },
             },
           },
-        },
-      }),
-      ok: true,
-      status: 200,
+        }),
+        ok: true,
+        status: 200,
+      };
     };
-  };
-  const app = boot({ currentOwner: "1", fetchImpl, storedBlockEnabled: "false" });
-  assert.equal((await app.hooks.fetchCountry("Alice")).found, true);
-  assert.deepEqual(requestedMethods, ["POST", "GET"]);
+    const app = boot({ currentOwner: "1", fetchImpl, storedBlockEnabled: "false" });
+    assert.equal((await app.hooks.fetchCountry("Alice")).found, true);
+    assert.equal((await app.hooks.fetchCountry("Bob")).found, true);
+    assert.deepEqual(
+      requestedMethods,
+      ["POST", "GET", "GET"],
+      `HTTP ${rejectStatus} on POST must fall back to GET and stay on GET for the session`,
+    );
+  }
 };
 
 const testTerminalLookupFailuresDoNotRetry = async () => {
@@ -1472,7 +1559,7 @@ const queueVerifiedBlock = (app, user) => {
     tweetText: `Post by ${user.screenName}`,
     tweetUrl: `https://x.com/${user.screenName}/status/1`,
   });
-  return app.hooks.enqueueBlock(user.screenName, user.country, makeQueuedTweet(), {
+  return app.hooks.enqueueBlock(user.screenName, { country: user.country, viaStore: false }, makeQueuedTweet(), {
     tweetText: `Post by ${user.screenName}`,
     tweetUrl: `https://x.com/${user.screenName}/status/1`,
     verifiedUser: user,
@@ -1649,10 +1736,10 @@ const testPausedStateAndOwnedVisibility = async () => {
 
   const feedCell = { dataset: {}, style: {} };
   const tweet = { closest: () => feedCell };
-  reloaded.hooks.applyPostVisibility(tweet, "Italy");
+  reloaded.hooks.applyPostVisibility(tweet, { country: "Italy" });
   assert.equal(feedCell.dataset.localefenceHidden, "true");
   assert.equal(feedCell.style.display, undefined, "LocaleFence must not overwrite X's inline display style");
-  reloaded.hooks.applyPostVisibility(tweet, "France");
+  reloaded.hooks.applyPostVisibility(tweet, { country: "France" });
   assert.equal(feedCell.dataset.localefenceHidden, undefined);
 };
 
@@ -1751,6 +1838,923 @@ const testResetCancelsAnotherTabsInFlightLookup = async () => {
   assert.equal([...storageValues.keys()].some((key) => key.startsWith("localefence.")), false);
 };
 
+const testSourceCountryExtraction = () => {
+  const app = boot({ currentOwner: "1", storedBlockEnabled: "false" });
+  const extract = app.hooks.extractSourceCountry;
+  assert.equal(extract("United States App Store"), "United States");
+  assert.equal(extract("United Kingdom Google Play"), "United Kingdom");
+  assert.equal(extract("Russian Federation Android App"), "Russian Federation");
+  assert.equal(extract("Saudi Arabia App Store"), "Saudi Arabia");
+  assert.equal(extract("Türkiye Android App"), "Turkey", "X's country variants must resolve to the canonical name");
+  assert.equal(extract("South Korea App Store"), "Korea");
+  assert.equal(extract("Google Play"), "", "a store label without a country must not guess one");
+  assert.equal(extract("Web"), "");
+  assert.equal(extract("Twitter for iPhone"), "");
+  assert.equal(extract("North America App Store"), "", "X regions are not store-region countries");
+  assert.equal(extract("  united   states  app STORE  "), "United States");
+  for (const label of ["Italy", "Italy Web", "France Embassy", "United States Unknown Store", "Congo Unknown Android App"]) {
+    assert.equal(extract(label), "", `an unrecognized label must not authorize a store-region match: ${label}`);
+  }
+};
+
+const testStoreRegionMatchingIsOptIn = () => {
+  const app = boot({ currentOwner: "1", storedBlockEnabled: "false" });
+  assert.match(
+    source,
+    /if \(nextEnabled && blockEnabled && !blockPaused\) \{[\s\S]*?globalThis\.confirm\(/,
+    "enabling store-region matching while automatic blocking is active must confirm before applying",
+  );
+  const user = {
+    restId: "2",
+    screenName: "Alice",
+    name: "Alice",
+    country: "France",
+    source: "Russian Federation Android App",
+    sourceCountry: "Russian Federation",
+    updatedAt: Date.now(),
+  };
+  app.storage("localefence.locations", "Italy\nRussian Federation");
+  const unmatched = app.hooks.matchAccountLocation(user);
+  assert.equal(unmatched.country, "", "the Connected-via store region must not match while the setting is off");
+  assert.equal(unmatched.viaStore, false);
+  const target = makeMutableFeedTarget("Alice");
+  app.hooks.applyPostVisibility(target.tweet, user);
+  assert.equal(target.cell.dataset.localefenceHidden, undefined);
+
+  app.storage("localefence.matchStoreRegion", "true");
+  assert.equal(app.hooks.getMatchStoreRegion(), true);
+  const stored = app.hooks.matchAccountLocation(user);
+  assert.equal(stored.country, "Russian Federation", "the store region must match once enabled");
+  assert.equal(stored.viaStore, true);
+  app.hooks.applyPostVisibility(target.tweet, user);
+  assert.equal(target.cell.dataset.localefenceHidden, "true");
+
+  const reported = app.hooks.matchAccountLocation({ ...user, country: "Italy" });
+  assert.equal(reported.country, "Italy", "a reported-location match always wins over the store region");
+  assert.equal(reported.viaStore, false);
+
+  app.storage("localefence.matchStoreRegion", "false");
+  app.hooks.applyPostVisibility(target.tweet, user);
+  assert.equal(
+    target.cell.dataset.localefenceHidden,
+    undefined,
+    "turning the setting off must release store-region matches",
+  );
+};
+
+const testStoreRegionDoesNotMatchWithoutOptIn = async () => {
+  const requests = [];
+  const fetchImpl = async (url) => {
+    requests.push(url);
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  const storageValues = new Map([["localefence.locations", "Russian Federation"]]);
+  const app = boot({ currentOwner: "1", fetchImpl, storageValues, storedOwner: "1" });
+  app.hooks.seedCachedUser({
+    restId: "2",
+    screenName: "Alice",
+    name: "Alice",
+    country: "France",
+    source: "Russian Federation Android App",
+    sourceCountry: "Russian Federation",
+    updatedAt: Date.now() - 1000,
+  });
+  const target = makeMutableFeedTarget("Alice");
+  app.hooks.enqueue("Alice", target.container, target.tweet);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(requests, [], "an unmatchable store region must not trigger a lookup or block");
+  assert.equal(app.hooks.getBlockQueue().length, 0);
+  assert.equal(target.cell.dataset.localefenceHidden, undefined);
+  assert.equal(target.getBadge().dataset.accountBasedIn, "France");
+};
+
+const testStoreRegionBlockNeedsFreshProof = async () => {
+  const aboutRequests = [];
+  const blockedRestIds = [];
+  const fetchImpl = async (url, options) => {
+    if (url.includes("AboutAccountQuery")) {
+      aboutRequests.push(url);
+      return {
+        headers: { get: () => null }, ok: true, status: 200,
+        json: async () => ({ data: { user_result_by_screen_name: { result: {
+          rest_id: "2", core: { name: "Alice", screen_name: "Alice" },
+          about_profile: { account_based_in: "France", source: "Russian Federation Android App" },
+        } } } }),
+      };
+    }
+    if (url.includes("blocks/create.json")) {
+      blockedRestIds.push(new URLSearchParams(options.body).get("user_id"));
+      return { json: async () => ({ id_str: "2" }), ok: true, status: 200 };
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  const storageValues = new Map([
+    ["localefence.locations", "Russian Federation"],
+    ["localefence.matchStoreRegion", "true"],
+  ]);
+  const app = boot({ currentOwner: "1", fetchImpl, storageValues, storedOwner: "1" });
+  app.hooks.seedCachedUser({
+    restId: "2",
+    screenName: "Alice",
+    name: "Alice",
+    country: "France",
+    source: "Russian Federation Android App",
+    sourceCountry: "Russian Federation",
+    updatedAt: Date.now() - 1000,
+  });
+  const target = makeMutableFeedTarget("Alice");
+  app.hooks.enqueue("Alice", target.container, target.tweet);
+  await waitFor(() => blockedRestIds.length === 1);
+  assert.deepEqual(blockedRestIds, ["2"]);
+  assert.equal(aboutRequests.length, 1, "a store-region match must be proven by a fresh lookup before blocking");
+  const history = app.hooks.getBlockHistory();
+  assert.equal(history.length, 1);
+  assert.equal(history[0].country, "Russian Federation");
+  assert.equal(history[0].matchSource, "store");
+  assert.equal(target.cell.dataset.localefenceHidden, "true", "a store-region match hides matching posts too");
+};
+
+const testLocationWarningIsDisplayOnly = async () => {
+  const blockedRestIds = [];
+  const fetchImpl = async (url, options) => {
+    if (url.includes("AboutAccountQuery")) {
+      return {
+        headers: { get: () => null }, ok: true, status: 200,
+        json: async () => ({ data: { user_result_by_screen_name: { result: {
+          rest_id: "2", core: { name: "Alice", screen_name: "Alice" },
+          about_profile: { account_based_in: "France", source: "Web", location_accurate: false },
+        } } } }),
+      };
+    }
+    if (url.includes("blocks/create.json")) {
+      blockedRestIds.push(new URLSearchParams(options.body).get("user_id"));
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  const app = boot({ currentOwner: "1", fetchImpl, storedOwner: "1" });
+  const target = makeMutableFeedTarget("Alice");
+  app.hooks.enqueue("Alice", target.container, target.tweet);
+  await waitFor(() => target.getBadge());
+  assert.equal(app.hooks.getCachedAccount("Alice").locationWarning, true);
+  const badge = target.getBadge();
+  assert.match(badge.title, /Location may not be accurate/);
+  assert.equal(badge.dataset.locationWarning, "true");
+  assert.equal(target.cell.dataset.localefenceHidden, undefined, "the VPN warning alone must not hide posts");
+  assert.deepEqual(blockedRestIds, [], "the VPN warning alone must not block");
+};
+
+const testStoreRegionHidesAfterFreshLookup = async () => {
+  const fetchImpl = async (url) => {
+    if (!url.includes("AboutAccountQuery")) throw new Error(`Unexpected request: ${url}`);
+    return {
+      headers: { get: () => null }, ok: true, status: 200,
+      json: async () => ({ data: { user_result_by_screen_name: { result: {
+        rest_id: "2", core: { name: "Alice", screen_name: "Alice" },
+        about_profile: { account_based_in: "France", source: "United States App Store" },
+      } } } }),
+    };
+  };
+  const storageValues = new Map([
+    ["localefence.locations", "United States"],
+    ["localefence.matchStoreRegion", "true"],
+  ]);
+  const app = boot({ currentOwner: "1", fetchImpl, storageValues, storedBlockEnabled: "false" });
+  const target = makeMutableFeedTarget("Alice");
+  app.hooks.enqueue("Alice", target.container, target.tweet);
+  await waitFor(() => target.getBadge());
+  assert.equal(target.cell.dataset.localefenceHidden, "true");
+  const badge = target.getBadge();
+  assert.equal(badge.dataset.accountBasedIn, "France", "the badge keeps showing X's reported country");
+  assert.match(badge.title, /Account based in France/);
+  assert.match(badge.title, /Connected via United States App Store/);
+  assert.equal(app.hooks.getCachedAccount("Alice").sourceCountry, "United States");
+};
+
+const testSharedCacheCarriesStoreRegion = async () => {
+  const app = boot({
+    currentOwner: "1",
+    fetchImpl: async (url) => { throw new Error(`Unexpected request: ${url}`); },
+    storedBlockEnabled: "false",
+    storageValues: new Map([["localefence.sharedLookupCache", JSON.stringify([{
+      restId: "2", screenName: "Alice", name: "Alice", country: "France",
+      source: "Russian Federation Android App", sourceCountry: "Russian Federation",
+      locationWarning: true, updatedAt: Date.now(),
+    }])]]),
+  });
+  const target = makeMutableFeedTarget("Alice");
+  app.hooks.enqueue("Alice", target.container, target.tweet);
+  await waitFor(() => app.hooks.getCachedAccount("Alice") != null);
+  const cached = app.hooks.getCachedAccount("Alice");
+  assert.equal(cached.sourceCountry, "Russian Federation");
+  assert.equal(cached.locationWarning, true);
+  assert.equal(cached.expired, false);
+};
+
+const testStoreRegionStats = () => {
+  const app = boot({ currentOwner: "1", storedBlockEnabled: "false" });
+  const users = [
+    { restId: "2", screenName: "Alice", country: "France", sourceCountry: "Italy" },
+    { restId: "3", screenName: "Bob", sourceCountry: "Italy" },
+    { restId: "4", screenName: "Carol", country: "Germany", sourceCountry: "France" },
+    { restId: "5", screenName: "Dave", locationWarning: true },
+  ];
+  users.forEach((user) => app.hooks.seedCachedUser({ ...user, updatedAt: Date.now() }));
+  assert.equal(app.hooks.getLocationStats().total, 4, "accounts without a reported country still count in the total");
+  assert.equal(app.hooks.getSelectedAccountCount(), 0);
+  app.storage("localefence.matchStoreRegion", "true");
+  const stats = app.hooks.getLocationStats();
+  assert.equal(stats.total, 4);
+  assert.equal(new Map(stats.rows).get("Italy"), 2, "store matches must appear in country counts");
+  assert.equal(app.hooks.getLocationCount("Europe", stats.counts), 3, "two countries in Europe must not double-count an account");
+  assert.equal(app.hooks.getSelectedAccountCount(), 2);
+  app.storage("localefence.locations", "Europe\nItaly\nFrance");
+  assert.equal(app.hooks.getSelectedAccountCount(), 3, "overlapping selected locations must count accounts once");
+  app.storage("localefence.matchStoreRegion", "false");
+  const reported = app.hooks.getLocationStats();
+  assert.equal(app.hooks.getLocationCount("Italy", reported.counts), 0);
+  assert.equal(app.hooks.getLocationCount("Europe", reported.counts), 2);
+};
+
+const testLegacyMetadataRefresh = async () => {
+  let requests = 0;
+  const app = boot({ currentOwner: "1", storedBlockEnabled: "false", fetchImpl: async () => {
+    requests += 1;
+    return { headers: { get: () => null }, ok: true, status: 200,
+      json: async () => ({ data: { user_result_by_screen_name: { result: {
+        rest_id: "2", core: { screen_name: "Alice" },
+        about_profile: { account_based_in: "France", source: "Italy App Store", location_accurate: false },
+      } } } }),
+    };
+  } });
+  await app.hooks.getHydrationReady();
+  app.hooks.seedCachedUser({ restId: "2", screenName: "Alice", country: "France", updatedAt: Date.now(), locationWarning: undefined });
+  assert.equal(app.hooks.getCachedAccount("Alice").expired, true, "legacy cache entries need the new metadata before the normal TTL");
+  const target = makeMutableFeedTarget("Alice");
+  app.hooks.enqueue("Alice", target.container, target.tweet);
+  assert.equal(target.getBadge().dataset.accountBasedIn, "France", "keep displaying the old country during migration");
+  await waitFor(() => target.getBadge()?.dataset.locationWarning === "true");
+  assert.match(target.getBadge().title, /Connected via Italy App Store/);
+  assert.equal(app.hooks.getCachedAccount("Alice").expired, false);
+  app.hooks.enqueue("Alice", target.container, target.tweet);
+  assert.equal(requests, 1);
+};
+
+const testNoWarningMetadataIsReusable = async () => {
+  let requests = 0;
+  const app = boot({ currentOwner: "1", storedBlockEnabled: "false", fetchImpl: async () => {
+    requests += 1;
+    return { headers: { get: () => null }, ok: true, status: 200,
+      json: async () => ({ data: { user_result_by_screen_name: { result: {
+        rest_id: "2", core: { screen_name: "Alice" }, about_profile: { account_based_in: "France" },
+      } } } }),
+    };
+  } });
+  const target = makeMutableFeedTarget("Alice");
+  app.hooks.enqueue("Alice", target.container, target.tweet);
+  await waitFor(() => target.getBadge());
+  assert.equal(app.hooks.getCachedAccount("Alice").locationWarning, false);
+  assert.equal(app.hooks.getCachedAccount("Alice").expired, false);
+  app.hooks.enqueue("Alice", target.container, target.tweet);
+  assert.equal(requests, 1, "fresh accounts with no source or accuracy field must remain cacheable");
+};
+
+const testMetadataOnlyBadges = async () => {
+  for (const [profile, expectedSource, expectedHidden] of [
+    [{ source: "Web", location_accurate: false }, "unknown", undefined],
+    [{ source: "Italy App Store", location_accurate: false }, "store", "true"],
+  ]) {
+    const target = makeMutableFeedTarget("Alice");
+    const app = boot({ currentOwner: "1", storedBlockEnabled: "false", feedTweets: [target.tweet],
+      storageValues: new Map([["localefence.matchStoreRegion", "true"]]),
+      fetchImpl: async () => ({ headers: { get: () => null }, ok: true, status: 200,
+        json: async () => ({ data: { user_result_by_screen_name: { result: {
+          rest_id: "2", core: { screen_name: "Alice" }, about_profile: profile,
+        } } } }),
+      }),
+    });
+    app.hooks.enqueue("Alice", target.container, target.tweet);
+    await waitFor(() => target.getBadge());
+    const badge = target.getBadge();
+    assert.equal(badge.dataset.accountLocationSource, expectedSource);
+    assert.equal(badge.dataset.locationWarning, "true", "X's warning must be visible without a based-in country");
+    assert.ok(badge.children.some((child) => child.dataset.locationWarningMarker));
+    assert.equal(badge.getAttribute("role"), "img");
+    assert.match(badge.getAttribute("aria-label"), /Account location unavailable.*Connected via.*reported by X/);
+    assert.equal(target.cell.dataset.localefenceHidden, expectedHidden);
+    if (expectedSource === "store") {
+      assert.ok(badge.children.some((child) => child.dataset.accountStoreMarker), "a store-only flag must be visibly labeled");
+      assert.match(badge.title, /Store region: Italy/);
+    }
+    app.storage("localefence.matchStoreRegion", "false");
+    assert.equal(target.cell.dataset.localefenceHidden, undefined, "changing the setting must refresh already rendered posts");
+    assert.equal(target.getBadge(), badge);
+  }
+};
+
+const testInvalidCachedStoreProof = async () => {
+  for (const sourceLabel of ["Web", "Italy Web", `Italy App Store${" ".repeat(90)}Unknown`, undefined]) {
+    const requests = [];
+    const app = boot({ currentOwner: "1", storedOwner: "1", storageValues: new Map([
+      ["localefence.matchStoreRegion", "true"],
+      ["localefence.sharedLookupCache", JSON.stringify([{
+        restId: "2", screenName: "Alice", country: "France", source: sourceLabel,
+        sourceCountry: "Italy", locationWarning: false, updatedAt: Date.now(),
+      }])],
+    ]), fetchImpl: async (url) => { requests.push(url); throw new Error(`Unexpected request: ${url}`); } });
+    const target = makeMutableFeedTarget("Alice");
+    app.hooks.enqueue("Alice", target.container, target.tweet);
+    assert.equal(app.hooks.getCachedAccount("Alice").sourceCountry, undefined, "a cached derived country needs a recognized raw label");
+    assert.equal(target.cell.dataset.localefenceHidden, undefined);
+    assert.deepEqual(requests, []);
+  }
+};
+
+const testStoreBlockReasonSnapshot = async () => {
+  let finishBlock;
+  const app = boot({ currentOwner: "1", storedOwner: "1", storageValues: new Map([
+    ["localefence.matchStoreRegion", "true"],
+  ]), fetchImpl: async (url) => {
+    if (url.includes("AboutAccountQuery")) return {
+      headers: { get: () => null }, ok: true, status: 200,
+      json: async () => ({ data: { user_result_by_screen_name: { result: {
+        rest_id: "2", core: { screen_name: "Alice" },
+        about_profile: { account_based_in: "France", source: "Italy App Store" },
+      } } } }),
+    };
+    assert.ok(url.includes("blocks/create.json"));
+    return new Promise((resolve) => { finishBlock = () => resolve({ ok: true, status: 200, json: async () => ({ id_str: "2" }) }); });
+  } });
+  const target = makeMutableFeedTarget("Alice");
+  app.hooks.enqueue("Alice", target.container, target.tweet);
+  await waitFor(() => finishBlock);
+  app.storage("localefence.locations", "France");
+  app.storage("localefence.matchStoreRegion", "false");
+  finishBlock();
+  await waitFor(() => app.hooks.getBlockHistory().length === 1);
+  const entry = app.hooks.getBlockHistory()[0];
+  assert.equal(entry.country, "Italy", "history must preserve the reason when the block request was sent");
+  assert.equal(entry.matchSource, "store", "later settings must not rewrite the reason for a real block");
+};
+
+const testStoreBlockCancelledWhileWaitingForLock = async () => {
+  const locks = makeLockManager();
+  let release;
+  const held = locks.request("localefence:block-request:1", () => new Promise((resolve) => { release = resolve; }));
+  let blockRequests = 0;
+  const app = boot({ currentOwner: "1", storedOwner: "1", navigatorImpl: { locks },
+    storageValues: new Map([["localefence.matchStoreRegion", "true"]]), fetchImpl: async (url) => {
+      if (url.includes("blocks/create.json")) { blockRequests += 1; throw new Error("Cancelled block was sent"); }
+      return { headers: { get: () => null }, ok: true, status: 200,
+        json: async () => ({ data: { user_result_by_screen_name: { result: {
+          rest_id: "2", core: { screen_name: "Alice" },
+          about_profile: { account_based_in: "France", source: "Italy App Store" },
+        } } } }),
+      };
+    },
+  });
+  const target = makeMutableFeedTarget("Alice");
+  app.hooks.enqueue("Alice", target.container, target.tweet);
+  await waitFor(() => app.hooks.getLookupRecord("Alice")?.status === "awaiting_block");
+  app.storage("localefence.matchStoreRegion", "false");
+  release();
+  await held;
+  await locks.request("localefence:block-request:1", () => {});
+  assert.equal(blockRequests, 0, "turning off store matching must cancel blocks waiting on another tab");
+  assert.equal(app.hooks.getBlockHistory().length, 0);
+};
+
+const testChangedStoreRegionCancelsBlock = async () => {
+  let blockRequests = 0;
+  const app = boot({ currentOwner: "1", storedOwner: "1",
+    storageValues: new Map([["localefence.matchStoreRegion", "true"]]), fetchImpl: async (url) => {
+      if (url.includes("blocks/create.json")) { blockRequests += 1; throw new Error("Stale store match was blocked"); }
+      return { headers: { get: () => null }, ok: true, status: 200,
+        json: async () => ({ data: { user_result_by_screen_name: { result: {
+          rest_id: "2", core: { screen_name: "Alice" },
+          about_profile: { account_based_in: "France", source: "Web", location_accurate: true },
+        } } } }),
+      };
+    },
+  });
+  app.hooks.seedCachedUser({ restId: "2", screenName: "Alice", country: "France",
+    source: "Italy App Store", sourceCountry: "Italy", locationWarning: true, updatedAt: Date.now() - 1000,
+  });
+  const target = makeMutableFeedTarget("Alice");
+  app.hooks.enqueue("Alice", target.container, target.tweet);
+  assert.equal(target.cell.dataset.localefenceHidden, "true");
+  assert.equal(target.getBadge().dataset.locationWarning, "true");
+  await waitFor(() => app.hooks.getCachedAccount("Alice").source === "Web" && !app.hooks.getLookupRecord("Alice"));
+  assert.equal(blockRequests, 0, "the fresh store region must decide whether to block");
+  assert.equal(target.cell.dataset.localefenceHidden, undefined, "a stale store match must release the post after lookup");
+  assert.equal(target.getBadge().dataset.locationWarning, undefined);
+  assert.ok(!target.getBadge().children.some((child) => child.dataset.locationWarningMarker));
+  assert.match(target.getBadge().title, /Connected via Web/);
+  assert.doesNotMatch(target.getBadge().title, /Location may not be accurate/);
+};
+
+const testInactiveBlockingRejectsStoreQueue = () => {
+  const app = boot({ currentOwner: "1", storedOwner: "1", storedBlockEnabled: "false",
+    storageValues: new Map([["localefence.matchStoreRegion", "true"]]),
+  });
+  const user = { restId: "2", screenName: "Alice", country: "France", sourceCountry: "Italy", updatedAt: Date.now() };
+  const matched = app.hooks.matchAccountLocation(user);
+  assert.equal(app.hooks.enqueueBlock("Alice", matched, null, { verifiedUser: user }), false);
+  app.storage("localefence.blockEnabled", "true");
+  app.hooks.pauseBlocking("Paused for test");
+  assert.equal(app.hooks.enqueueBlock("Alice", matched, null, { verifiedUser: user }), false);
+  assert.equal(app.hooks.getBlockQueue().length, 0, "disabled or paused blocking must not enqueue store matches");
+};
+
+const testCrossTabPauseExclusionAndCounterInsideLock = async () => {
+  const sharedStorage = new Map([
+    ["localefence.blockEnabled", "true"],
+    ["localefence.blockOwnerRestId", "1"],
+    ["localefence.locations", "Italy"],
+    ["localefence.notificationsEnabled", "false"],
+  ]);
+  const locks = makeLockManager();
+  const delayedEvents = [];
+  const storageBus = [];
+  const blocked = [];
+  let failFirst = true;
+  const fetchImpl = async (_url, options) => {
+    const restId = new URLSearchParams(options.body).get("user_id");
+    blocked.push(restId);
+    if (failFirst) {
+      failFirst = false;
+      throw new Error("Simulated X failure");
+    }
+    return { ok: true, status: 200, json: async () => ({ id_str: restId }) };
+  };
+  const common = {
+    currentOwner: "1", storedOwner: "1", storageValues: sharedStorage,
+    storageBus, storageDelivery: (fn) => delayedEvents.push(fn),
+    navigatorImpl: { locks }, fetchImpl,
+  };
+  const tabA = boot(common);
+  const tabB = boot(common);
+  queueVerifiedBlock(tabA, { restId: "2", screenName: "Alice", country: "Italy", updatedAt: Date.now() });
+  queueVerifiedBlock(tabB, { restId: "3", screenName: "Bob", country: "Italy", updatedAt: Date.now() });
+  await waitFor(() => tabA.hooks.getBlockPaused() && tabB.hooks.getBlockPaused());
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(blocked, ["2"], "a waiting tab must honor another tab's safety pause before storage events arrive");
+
+  // Exclusion written in storage before storage events arrive must also cancel a waiting block.
+  const exclusionStorage = new Map([
+    ["localefence.blockEnabled", "true"],
+    ["localefence.blockOwnerRestId", "1"],
+    ["localefence.locations", "Italy"],
+    ["localefence.notificationsEnabled", "false"],
+  ]);
+  let releaseLock;
+  const manualLocks = {
+    request: (_name, cb) => new Promise((resolve) => { releaseLock = () => resolve(cb()); }),
+  };
+  const exclusionBlocked = [];
+  const tabC = boot({
+    currentOwner: "1", storedOwner: "1", storageValues: exclusionStorage,
+    navigatorImpl: { locks: manualLocks },
+    fetchImpl: async (_url, options) => {
+      exclusionBlocked.push(new URLSearchParams(options.body).get("user_id"));
+      return { ok: true, status: 200, json: async () => ({ id_str: "2" }) };
+    },
+  });
+  queueVerifiedBlock(tabC, { restId: "2", screenName: "Alice", country: "Italy", updatedAt: Date.now() });
+  exclusionStorage.set("localefence.excludedUserIds", "2");
+  releaseLock();
+  await waitFor(() => tabC.hooks.getLookupRecord("Alice") == null);
+  assert.deepEqual(exclusionBlocked, [], "an excluded account in storage must never be blocked by a waiting tab");
+
+  // Two tabs blocking distinct accounts must not lose totalBlocked increments.
+  const countStorage = new Map([
+    ["localefence.blockEnabled", "true"],
+    ["localefence.blockOwnerRestId", "1"],
+    ["localefence.locations", "Italy"],
+    ["localefence.notificationsEnabled", "false"],
+  ]);
+  const countLocks = makeLockManager();
+  const countFetch = async (_url, options) => ({
+    ok: true, status: 200, json: async () => ({ id_str: new URLSearchParams(options.body).get("user_id") }),
+  });
+  const t1 = boot({ currentOwner: "1", storedOwner: "1", storageValues: countStorage, navigatorImpl: { locks: countLocks }, fetchImpl: countFetch });
+  const t2 = boot({ currentOwner: "1", storedOwner: "1", storageValues: countStorage, navigatorImpl: { locks: countLocks }, fetchImpl: countFetch });
+  queueVerifiedBlock(t1, { restId: "10", screenName: "UserOne", country: "Italy", updatedAt: Date.now() });
+  queueVerifiedBlock(t2, { restId: "11", screenName: "UserTwo", country: "Italy", updatedAt: Date.now() });
+  await waitFor(() => t1.hooks.getLookupRecord("UserOne") == null && t2.hooks.getLookupRecord("UserTwo") == null);
+  assert.equal(countStorage.get("localefence.totalBlocked"), "2");
+};
+
+const testRejectedWebLockFallsBackWithoutDeadlock = async () => {
+  let unhandled = 0;
+  const onUnhandled = () => { unhandled += 1; };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const app = boot({
+      currentOwner: "1",
+      storedBlockEnabled: "false",
+      navigatorImpl: {
+        locks: {
+          request: () => Promise.reject(new Error("SecurityError: Web Locks denied")),
+        },
+      },
+      fetchImpl: async () => ({
+        headers: { get: () => null }, ok: true, status: 200,
+        json: async () => ({ data: { user_result_by_screen_name: { result: {
+          rest_id: "2", core: { screen_name: "Alice" }, about_profile: { account_based_in: "France" },
+        } } } }),
+      }),
+    });
+    const target = makeMutableFeedTarget("Alice");
+    app.hooks.enqueue("Alice", target.container, target.tweet);
+    await waitFor(() => target.getBadge()?.dataset.accountBasedIn === "France");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(unhandled, 0, "a rejected Web Lock must not leak an unhandled rejection");
+  } finally {
+    process.removeListener("unhandledRejection", onUnhandled);
+  }
+};
+
+const testAboutQueryIdOriginAndPostResetGuard = async () => {
+  const storageValues = new Map();
+  const app = boot({ currentOwner: "1", storedBlockEnabled: "false", storageValues });
+  assert.equal(
+    app.hooks.extractAboutQueryId("https://x.com/i/api/graphql/ValidQueryId1234/AboutAccountQuery?variables=%7B%7D"),
+    "ValidQueryId1234",
+  );
+  assert.equal(
+    app.hooks.extractAboutQueryId("https://api.x.com/graphql/ApiSubdomainId12/AboutAccountQuery?variables=%7B%7D"),
+    "ApiSubdomainId12",
+  );
+  assert.equal(
+    app.hooks.extractAboutQueryId("https://evil.example/i/api/graphql/EvilQueryId1234/AboutAccountQuery"),
+    "",
+    "cross-origin URLs must never supply an AboutAccountQuery ID",
+  );
+  assert.equal(
+    app.hooks.extractAboutQueryId("https://x.com/other/graphql/WrongPath12345/AboutAccountQuery"),
+    "",
+    "non-API paths must not be accepted as AboutAccountQuery URLs",
+  );
+  await app.hooks.resetLocaleFenceData();
+  assert.equal(
+    app.hooks.rememberAboutQueryId("https://x.com/i/api/graphql/LateObserved1234/AboutAccountQuery", { fromObserver: true }),
+    false,
+    "late observer entries right after reset must not repopulate storage",
+  );
+  assert.equal(storageValues.get("localefence.aboutQueryId"), undefined);
+};
+
+const testPrototypeKeysAndMalformedAccountFields = async () => {
+  const app = boot({
+    currentOwner: "1", storedBlockEnabled: "false",
+    fetchImpl: async () => ({
+      headers: { get: () => null }, ok: true, status: 200,
+      json: async () => ({ data: { user_result_by_screen_name: { result: {
+        rest_id: "2",
+        core: { screen_name: "Alice", name: { unexpected: true } },
+        about_profile: { account_based_in: "constructor" },
+      } } } }),
+    }),
+  });
+  assert.equal(app.hooks.resolveCountryAlias("constructor"), "constructor");
+  assert.equal(app.hooks.resolveCountryAlias("toString"), "toString");
+  assert.equal(app.hooks.resolveCountryAlias(42), "");
+  const result = await app.hooks.fetchCountry("Alice");
+  assert.equal(result.found, true);
+  assert.equal(result.user.country, "constructor");
+  assert.equal(result.user.name, undefined);
+};
+
+const testInFlightBlockDedupAndOrphanCleanup = async () => {
+  let finishAlice;
+  let aboutRequests = 0;
+  const blocked = [];
+  const app = boot({
+    currentOwner: "1", storedOwner: "1",
+    fetchImpl: async (url, options) => {
+      if (url.includes("AboutAccountQuery")) {
+        aboutRequests += 1;
+        return {
+          headers: { get: () => null }, ok: true, status: 200,
+          json: async () => ({ data: { user_result_by_screen_name: { result: {
+            rest_id: "2", core: { screen_name: "Alice" }, about_profile: { account_based_in: "Italy" },
+          } } } }),
+        };
+      }
+      const restId = new URLSearchParams(options.body).get("user_id");
+      blocked.push(restId);
+      return new Promise((resolve) => {
+        finishAlice = () => resolve({ ok: true, status: 200, json: async () => ({ id_str: restId }) });
+      });
+    },
+  });
+  const target1 = makeMutableFeedTarget("Alice");
+  const target2 = makeMutableFeedTarget("Alice");
+  app.hooks.enqueue("Alice", target1.container, target1.tweet);
+  await waitFor(() => Boolean(finishAlice));
+  // Encountering another post by Alice while her block is in flight must not re-queue or re-fetch.
+  app.hooks.enqueue("Alice", target2.container, target2.tweet);
+  assert.equal(app.hooks.getBlockQueue().length, 0);
+  // Queue Bob behind Alice, then mark Bob as known-blocked in storage before his turn.
+  queueVerifiedBlock(app, { restId: "3", screenName: "Bob", country: "Italy", updatedAt: Date.now() });
+  app.storage("localefence.blockedAccounts", "1:3");
+  finishAlice();
+  await waitFor(() => app.hooks.getLookupRecord("Alice") == null && app.hooks.getLookupRecord("Bob") == null);
+  assert.equal(aboutRequests, 1, "an in-flight block must not trigger a duplicate lookup");
+  assert.deepEqual(blocked, ["2"], "known-blocked Bob must be skipped and cleaned up from lookupRecords");
+};
+
+const testCrossTabCacheClearAndQueueClearSync = async () => {
+  const storageValues = new Map([["localefence.locations", "Italy"]]);
+  const storageBus = [];
+  const target = makeMutableFeedTarget("Alice");
+  const tabA = boot({ currentOwner: "1", storedBlockEnabled: "false", storageValues, storageBus });
+  const tabB = boot({
+    currentOwner: "1", storedBlockEnabled: "false", storageValues, storageBus,
+    feedTweets: [target.tweet], visibilityState: "hidden",
+  });
+  tabB.hooks.seedCachedUser({ restId: "2", screenName: "Alice", country: "Italy", updatedAt: Date.now() });
+  tabB.hooks.enqueue("Alice", target.container, target.tweet);
+  assert.equal(target.cell.dataset.localefenceHidden, "true");
+  tabB.dispatchStorage({ key: "localefence.sharedLookupCache", newValue: null });
+  assert.equal(target.cell.dataset.localefenceHidden, undefined, "cross-tab cache clear must un-hide previously hidden posts");
+
+  // Clearing queue in Tab A must also clear Tab B's in-memory lookup queue.
+  tabB.hooks.rememberLookupRecord("Bob", { tweetText: "hi", tweetUrl: "" });
+  assert.ok(tabB.hooks.getLookupRecord("Bob"));
+  await tabA.hooks.clearLookupRecords(true);
+  assert.equal(tabB.hooks.getLookupRecord("Bob"), undefined, "cross-tab queue clear must clear queued records in other tabs");
+};
+
+const testEmptyRateLimitHeadersDoNotTriggerBackoff = async () => {
+  const resetAt = Math.floor(Date.now() / 1000) + 600;
+  const app = boot({
+    currentOwner: "1", storedBlockEnabled: "false",
+    fetchImpl: async () => ({
+      ok: true, status: 200,
+      headers: {
+        get: (name) => name === "x-rate-limit-remaining" ? "" : name === "x-rate-limit-limit" ? "  " : name === "x-rate-limit-reset" ? String(resetAt) : null,
+      },
+      json: async () => ({ data: { user_result_by_screen_name: { result: {
+        rest_id: "2", core: { screen_name: "Alice" }, about_profile: { account_based_in: "France" },
+      } } } }),
+    }),
+  });
+  const target = makeMutableFeedTarget("Alice");
+  app.hooks.enqueue("Alice", target.container, target.tweet);
+  await waitFor(() => target.getBadge() != null);
+  assert.equal(app.hooks.getLookupBackoffUntil(), 0, "empty remaining header must not be parsed as 0");
+  assert.equal(app.hooks.getLookupQuota().remaining, null);
+  assert.equal(app.hooks.getLookupQuota().limit, null);
+};
+
+const testDrawerCjkLabelsExternalLinkRejectionAndStateBadgePreservation = async () => {
+  const app = boot({ currentOwner: "1", storedBlockEnabled: "false" });
+  for (const shortLabel of ["設定", "设置", "설정"]) {
+    const makeCjkRow = () => ({
+      attributes: { href: "/settings" }, dataset: {},
+      children: [{ attributes: {}, setAttribute() {}, innerHTML: "" }, { children: [], textContent: shortLabel }],
+      querySelector(s) { return s === "svg" ? this.children[0] : null; },
+      querySelectorAll(s) { return s === "span, div" ? [this.children[1]] : []; },
+      removeAttribute() {}, setAttribute(k, v) { this.attributes[k] = v; }, addEventListener() {},
+      cloneNode() { return makeCjkRow(); },
+    });
+    const entry = app.hooks.buildLocaleFenceDrawerEntry(makeCjkRow());
+    assert.equal(entry.children[1].textContent, "LocaleFence", `2-char CJK label ${shortLabel} must be relabeled`);
+    assert.equal(entry.attributes.role, "button");
+  }
+  const externalSettingLink = makeDrawerLink("https://example.com/my-settings-guide", "Settings guide");
+  const tweetSettingLink = {
+    ...makeDrawerLink("/settings", "Tweet link"),
+    closest: (selector) => selector === '[data-testid="tweet"]' ? { dataset: { testid: "tweet" } } : null,
+  };
+  assert.equal(
+    app.hooks.findLocaleFenceDrawerAnchor({ querySelector: () => null, querySelectorAll: () => [externalSettingLink, tweetSettingLink] }),
+    null,
+    "external links and links inside tweets must never be selected as drawer anchors",
+  );
+  assert.ok(source.includes("[data-localefence-drawer-entry]"), "stale runtime cleanup must handle drawer entries");
+
+  // Re-rendering a badge must preserve [data-account-state] pills and update aria-label.
+  const target = makeMutableFeedTarget("Alice");
+  const badgeApp = boot({ currentOwner: "1", storedBlockEnabled: "false", feedTweets: [target.tweet], visibilityState: "hidden" });
+  badgeApp.hooks.applyCountry(target.container, target.tweet, { country: "Italy", locationWarning: false }, "Alice");
+  badgeApp.hooks.markFeedAccount("Alice", "Blocked");
+  assert.ok(target.getBadge().querySelector("[data-account-state]"));
+  assert.match(target.getBadge().getAttribute("aria-label"), /Blocked/);
+  badgeApp.hooks.applyCountry(target.container, target.tweet, { country: "Italy", locationWarning: true }, "Alice");
+  assert.equal(target.getBadge().querySelector("[data-account-state]")?.textContent, "Blocked");
+  assert.match(target.getBadge().getAttribute("aria-label"), /Blocked/);
+};
+
+const testEmpty200ProfileCachedAsUnavailable = async () => {
+  let requests = 0;
+  const app = boot({
+    currentOwner: "1", storedBlockEnabled: "false",
+    fetchImpl: async () => {
+      requests += 1;
+      return {
+        headers: { get: () => null }, ok: true, status: 200,
+        json: async () => ({ data: { user_result_by_screen_name: {} } }),
+      };
+    },
+  });
+  const target = makeMutableFeedTarget("GhostUser");
+  app.hooks.enqueue("GhostUser", target.container, target.tweet);
+  await waitFor(() => app.hooks.isUnavailableAccount("GhostUser"));
+  app.hooks.enqueue("GhostUser", target.container, target.tweet);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(requests, 1, "an empty 200 profile result must be cached as unavailable to avoid repeated requests");
+};
+
+const makeMiniDomElement = (tagName, attrs = {}, text = "") => {
+  const el = {
+    tagName: tagName.toUpperCase(),
+    nodeType: 1,
+    attributes: { ...attrs },
+    dataset: {},
+    children: [],
+    parentElement: null,
+    parentNode: null,
+    isConnected: true,
+    _text: text,
+    get textContent() {
+      return this._text || this.children.map((c) => c.textContent || "").join("");
+    },
+    set textContent(value) {
+      this.children = [];
+      this._text = String(value);
+    },
+    appendChild(child) {
+      child.parentElement = this;
+      child.parentNode = this;
+      this.children.push(child);
+      return child;
+    },
+    remove() {
+      if (this.parentElement) {
+        this.parentElement.children = this.parentElement.children.filter((c) => c !== this);
+      }
+    },
+    setAttribute(name, value) { this.attributes[name] = String(value); },
+    getAttribute(name) { return this.attributes[name] ?? null; },
+    matches(selector) {
+      return selector.split(",").map((part) => part.trim()).some((part) => {
+        if (part === "article") return this.tagName === "ARTICLE";
+        if (part === "ul") return this.tagName === "UL";
+        if (part === "li") return this.tagName === "LI";
+        if (part === "a") return this.tagName === "A";
+        if (part === "button") return this.tagName === "BUTTON";
+        if (part === "img") return this.tagName === "IMG";
+        if (part === "video") return this.tagName === "VIDEO";
+        if (part === "time") return this.tagName === "TIME";
+        if (part === '[role="link"]') return this.attributes.role === "link";
+        if (part === '[role="group"]') return this.attributes.role === "group";
+        if (part === '[data-testid="tweet"]') return this.attributes["data-testid"] === "tweet";
+        if (part === '[data-testid="User-Name"]') return this.attributes["data-testid"] === "User-Name";
+        if (part === '[data-testid="cellInnerDiv"]') return this.attributes["data-testid"] === "cellInnerDiv";
+        if (part === '[data-testid="tweetText"]') return this.attributes["data-testid"] === "tweetText";
+        if (part === '[data-testid="tweetPhoto"]') return this.attributes["data-testid"] === "tweetPhoto";
+        if (part === "[data-account-based-in]") return "accountBasedIn" in this.dataset;
+        if (part === "[data-account-state]") return "accountState" in this.dataset;
+        if (part === 'a[href^="/"]') return this.tagName === "A" && (this.attributes.href || "").startsWith("/");
+        if (part === 'a[href*="/status/"]') return this.tagName === "A" && (this.attributes.href || "").includes("/status/");
+        if (part === 'div[dir="auto"][lang]') return this.tagName === "DIV" && this.attributes.dir === "auto" && Boolean(this.attributes.lang);
+        return false;
+      });
+    },
+    closest(selector) {
+      let current = this;
+      while (current) {
+        if (current.matches(selector)) return current;
+        current = current.parentElement;
+      }
+      return null;
+    },
+    querySelector(selector) { return this.querySelectorAll(selector)[0] || null; },
+    querySelectorAll(selector) {
+      const results = [];
+      const walk = (node) => {
+        for (const child of node.children || []) {
+          if (child.matches?.(selector)) results.push(child);
+          walk(child);
+        }
+      };
+      walk(this);
+      return results;
+    },
+  };
+  return el;
+};
+
+const testModernDesktopDomWithoutTestIds = async () => {
+  const lookups = [];
+  const app = boot({
+    currentOwner: "1",
+    storedBlockEnabled: "false",
+    storageValues: new Map([["localefence.locations", "Italy"]]),
+    fetchImpl: async (url) => {
+      const { screenName } = JSON.parse(new URL(url).searchParams.get("variables"));
+      lookups.push(screenName);
+      return {
+        headers: { get: () => null }, ok: true, status: 200,
+        json: async () => ({
+          data: {
+            user_result_by_screen_name: {
+              result: {
+                rest_id: screenName === "Alice" ? "2" : "3",
+                core: { name: screenName, screen_name: screenName },
+                about_profile: { account_based_in: screenName === "Alice" ? "Italy" : "France" },
+              },
+            },
+          },
+        }),
+      };
+    },
+  });
+
+  // Build X's data-testid-less desktop structure: ul > li > div[role=link] > article (with nested quoted article).
+  const ul = makeMiniDomElement("ul");
+  const li = makeMiniDomElement("li");
+  const card = makeMiniDomElement("div", { role: "link" });
+  const overlayStatus = makeMiniDomElement("a", { href: "/Alice/status/12345" });
+  const article = makeMiniDomElement("article");
+  const outer = makeMiniDomElement("div");
+  const avatarCol = makeMiniDomElement("div");
+  const avatarLink = makeMiniDomElement("a", { href: "/Alice" });
+  avatarLink.appendChild(makeMiniDomElement("img"));
+  avatarCol.appendChild(avatarLink);
+
+  const mainCol = makeMiniDomElement("div");
+  const headerBar = makeMiniDomElement("div");
+  const headerRow = makeMiniDomElement("div");
+  const nameAndHandle = makeMiniDomElement("div");
+  const nameDiv = makeMiniDomElement("div");
+  const nameSpan = makeMiniDomElement("span");
+  nameSpan.appendChild(makeMiniDomElement("a", { href: "/Alice" }, "Alice Display"));
+  nameDiv.appendChild(nameSpan);
+  const handleDiv = makeMiniDomElement("div");
+  const handleSpan = makeMiniDomElement("span");
+  const handleLink = makeMiniDomElement("a", { href: "/Alice" }, "@Alice");
+  handleSpan.appendChild(handleLink);
+  handleDiv.appendChild(handleSpan);
+  nameAndHandle.appendChild(nameDiv);
+  nameAndHandle.appendChild(handleDiv);
+  const tsSpan = makeMiniDomElement("span");
+  const tsLink = makeMiniDomElement("a", { href: "/Alice/status/12345" }, "2h");
+  tsSpan.appendChild(tsLink);
+  headerRow.appendChild(nameAndHandle);
+  headerRow.appendChild(tsSpan);
+  const rightButtons = makeMiniDomElement("div");
+  rightButtons.appendChild(makeMiniDomElement("button"));
+  headerBar.appendChild(headerRow);
+  headerBar.appendChild(rightButtons);
+
+  const bodyText = makeMiniDomElement("div", { dir: "auto", lang: "en" });
+  bodyText.appendChild(makeMiniDomElement("span", {}, "Hello from modern X DOM"));
+  bodyText.appendChild(makeMiniDomElement("a", { href: "/Mentioned" }, "@Mentioned"));
+
+  // Nested quoted tweet <article> must not be treated as a separate feed post or hijack outer author.
+  const quoteWrap = makeMiniDomElement("div", { role: "link" });
+  const quotedArticle = makeMiniDomElement("article");
+  const quotedHeader = makeMiniDomElement("div");
+  quotedHeader.appendChild(makeMiniDomElement("a", { href: "/QuotedUser" }, "@QuotedUser"));
+  quotedArticle.appendChild(quotedHeader);
+  quoteWrap.appendChild(quotedArticle);
+
+  const actions = makeMiniDomElement("div", { role: "group" });
+  actions.appendChild(makeMiniDomElement("a", { href: "/Alice/status/12345/analytics" }, "10"));
+
+  mainCol.appendChild(headerBar);
+  mainCol.appendChild(bodyText);
+  mainCol.appendChild(quoteWrap);
+  mainCol.appendChild(actions);
+  outer.appendChild(avatarCol);
+  outer.appendChild(mainCol);
+  article.appendChild(outer);
+  card.appendChild(overlayStatus);
+  card.appendChild(article);
+  li.appendChild(card);
+  ul.appendChild(li);
+
+  app.hooks.findTweets(ul);
+  await waitFor(() => headerRow.querySelector("[data-account-based-in]") != null);
+  assert.deepEqual(lookups, ["Alice"], "only the outer <article> author must be queried, not mentions or quoted articles");
+  assert.equal(headerRow.querySelector("[data-account-based-in]").dataset.accountBasedIn, "Italy");
+  assert.equal(li.dataset.localefenceHidden, "true", "matching posts in modern DOM must hide their ul > li timeline cell");
+  assert.equal(quotedArticle.querySelector("[data-account-based-in]"), null);
+
+  // Recycling the article to Bob via href mutation must clear the stale flag and un-hide the li cell.
+  handleLink.setAttribute("href", "/Bob");
+  handleLink.textContent = "@Bob";
+  tsLink.setAttribute("href", "/Bob/status/67890");
+  app.mutate([{ type: "attributes", attributeName: "href", target: handleLink, addedNodes: [], removedNodes: [] }]);
+  assert.equal(li.dataset.localefenceHidden, undefined);
+  await waitFor(() => headerRow.querySelector("[data-account-based-in]")?.dataset.accountUsername === "Bob");
+  assert.equal(headerRow.querySelector("[data-account-based-in]").dataset.accountBasedIn, "France");
+  assert.equal(li.dataset.localefenceHidden, undefined);
+};
+
 const run = async () => {
   testAndroidMountRecovery();
   testDrawerEntry();
@@ -1789,6 +2793,32 @@ const run = async () => {
   await testResetCancelsInFlightLookup();
   await testResetDoesNotRestoreInFlightBlockData();
   await testResetCancelsAnotherTabsInFlightLookup();
+  testSourceCountryExtraction();
+  testStoreRegionMatchingIsOptIn();
+  await testStoreRegionDoesNotMatchWithoutOptIn();
+  await testStoreRegionBlockNeedsFreshProof();
+  await testLocationWarningIsDisplayOnly();
+  await testStoreRegionHidesAfterFreshLookup();
+  await testSharedCacheCarriesStoreRegion();
+  testStoreRegionStats();
+  await testLegacyMetadataRefresh();
+  await testNoWarningMetadataIsReusable();
+  await testMetadataOnlyBadges();
+  await testInvalidCachedStoreProof();
+  await testStoreBlockReasonSnapshot();
+  await testStoreBlockCancelledWhileWaitingForLock();
+  await testChangedStoreRegionCancelsBlock();
+  testInactiveBlockingRejectsStoreQueue();
+  await testCrossTabPauseExclusionAndCounterInsideLock();
+  await testRejectedWebLockFallsBackWithoutDeadlock();
+  await testAboutQueryIdOriginAndPostResetGuard();
+  await testPrototypeKeysAndMalformedAccountFields();
+  await testInFlightBlockDedupAndOrphanCleanup();
+  await testCrossTabCacheClearAndQueueClearSync();
+  await testEmptyRateLimitHeadersDoNotTriggerBackoff();
+  await testDrawerCjkLabelsExternalLinkRejectionAndStateBadgePreservation();
+  await testEmpty200ProfileCachedAsUnavailable();
+  await testModernDesktopDomWithoutTestIds();
 };
 
 module.exports = { boot, makeMutableFeedTarget, waitFor };

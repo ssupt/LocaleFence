@@ -177,12 +177,144 @@ const testResetDuringHydrationClearsPersistentData = async () => {
   assert.equal([...storageValues.keys()].some((key) => key.startsWith("localefence.")), false);
 };
 
+const testHydrationKeepsConnectedViaFields = async () => {
+  const factory = new IDBFactory();
+  const db = await openDatabase(factory);
+  const tx = db.transaction("aboutUsers", "readwrite");
+  const done = transactionComplete(tx);
+  tx.objectStore("aboutUsers").put({
+    restId: "2", screenName: "Alice", name: "Alice", country: "France",
+    source: "Russian Federation Android App", sourceCountry: "Russian Federation",
+    locationWarning: true, updatedAt: Date.now(),
+  }, "2");
+  tx.objectStore("aboutUsers").put({
+    restId: "3", screenName: "Bob", name: "Bob", country: "Italy", updatedAt: Date.now(),
+  }, "3");
+  tx.objectStore("aboutUsers").put({
+    restId: "4", screenName: "Carol", country: "France", source: "Web",
+    sourceCountry: "Italy", locationWarning: false, updatedAt: Date.now(),
+  }, "4");
+  await done;
+  db.close();
+  const app = boot({ currentOwner: "1", storedBlockEnabled: "false", indexedDBImpl: factory });
+  await app.hooks.getHydrationReady();
+  const alice = app.hooks.getCachedAccount("Alice");
+  assert.equal(alice.sourceCountry, "Russian Federation");
+  assert.equal(alice.locationWarning, true);
+  assert.equal(alice.expired, false);
+  const bob = app.hooks.getCachedAccount("Bob");
+  assert.equal(bob.sourceCountry, undefined, "legacy records without Connected-via data must hydrate unchanged");
+  assert.equal(bob.locationWarning, undefined);
+  assert.equal(bob.expired, true, "legacy metadata must refresh on encounter");
+  const carol = app.hooks.getCachedAccount("Carol");
+  assert.equal(carol.sourceCountry, undefined, "IndexedDB must not revive an invalid derived store country");
+  assert.equal(carol.locationWarning, false, "a recorded absence of warnings must survive hydration");
+  assert.equal(carol.expired, false);
+  const saved = await readStore(factory, "aboutUsers");
+  assert.equal(saved.find((user) => user.restId === "4").sourceCountry, undefined);
+};
+
+const testLookupPersistsMetadataAcrossReloads = async () => {
+  const factory = new IDBFactory();
+  const first = boot({ currentOwner: "1", storedBlockEnabled: "false", indexedDBImpl: factory,
+    fetchImpl: async () => ({ headers: { get: () => null }, ok: true, status: 200,
+      json: async () => ({ data: { user_result_by_screen_name: { result: {
+        rest_id: "2", core: { screen_name: "Alice" },
+        about_profile: { account_based_in: "France", source: "Italy App Store", location_accurate: true },
+      } } } }),
+    }),
+  });
+  await first.hooks.getHydrationReady();
+  await first.hooks.fetchCountry("Alice");
+  const reloaded = boot({ currentOwner: "1", storedBlockEnabled: "false", indexedDBImpl: factory,
+    storageValues: new Map([["localefence.matchStoreRegion", "true"]]),
+    fetchImpl: async (url) => { throw new Error(`Unexpected request: ${url}`); },
+  });
+  await reloaded.hooks.getHydrationReady();
+  const target = makeMutableFeedTarget("Alice");
+  reloaded.hooks.enqueue("Alice", target.container, target.tweet);
+  const cached = reloaded.hooks.getCachedAccount("Alice");
+  assert.equal(cached.locationWarning, false);
+  assert.equal(cached.expired, false);
+  assert.equal(cached.sourceCountry, "Italy");
+  assert.equal(target.cell.dataset.localefenceHidden, "true", "store matching must work after reloading persisted metadata");
+  assert.equal(reloaded.hooks.getLookupRecord("Alice"), undefined, "fresh persisted metadata must avoid a new lookup");
+};
+
+const testHydrationSkipsUnchangedStorePuts = async () => {
+  const factory = new IDBFactory();
+  const db = await openDatabase(factory);
+  const tx = db.transaction("aboutUsers", "readwrite");
+  const done = transactionComplete(tx);
+  const now = Date.now();
+  tx.objectStore("aboutUsers").put({
+    restId: "2", screenName: "Alice", name: "Alice", country: "France",
+    source: "Italy App Store", sourceCountry: "Italy", locationWarning: false, updatedAt: now,
+  }, "2");
+  tx.objectStore("aboutUsers").put({
+    restId: "3", screenName: "Bob", country: "France", source: "Web",
+    sourceCountry: "Italy", locationWarning: false, updatedAt: now,
+  }, "3");
+  await done;
+  db.close();
+  const putKeys = [];
+  const spiedFactory = {
+    open(name, version) {
+      const request = factory.open(name, version);
+      request.addEventListener("success", () => {
+        const opened = request.result;
+        const originalTx = opened.transaction.bind(opened);
+        opened.transaction = (storeName, mode) => {
+          const t = originalTx(storeName, mode);
+          if (storeName !== "aboutUsers") return t;
+          const originalStore = t.objectStore.bind(t);
+          t.objectStore = (s) => {
+            const store = originalStore(s);
+            const originalPut = store.put.bind(store);
+            store.put = (val, key) => {
+              putKeys.push(key ?? val?.restId);
+              return originalPut(val, key);
+            };
+            return store;
+          };
+          return t;
+        };
+      });
+      return request;
+    },
+  };
+  const app = boot({ currentOwner: "1", storedBlockEnabled: "false", indexedDBImpl: spiedFactory });
+  await app.hooks.getHydrationReady();
+  assert.deepEqual(putKeys, ["3"], "hydration must only rewrite records whose normalized data changed");
+};
+
+const testClearQueueAndHistoryDuringHydrationAreNotResurrected = async () => {
+  const factory = new IDBFactory();
+  const db = await openDatabase(factory);
+  const tx = db.transaction(["lookupQueue", "blockHistory"], "readwrite");
+  const done = transactionComplete(tx);
+  tx.objectStore("lookupQueue").put({ key: "alice", username: "Alice", ownerRestId: "1", status: "failed", enqueuedAt: Date.now() });
+  tx.objectStore("blockHistory").add({ restId: "2", ownerRestId: "1", username: "Alice", status: "blocked", blockedAt: Date.now() });
+  await done;
+  db.close();
+  const app = boot({ currentOwner: "1", storedBlockEnabled: "false", indexedDBImpl: factory, visibilityState: "hidden" });
+  await Promise.all([app.hooks.clearLookupRecords(), app.hooks.clearBlockHistory()]);
+  assert.equal(app.hooks.getLookupRecord("Alice"), undefined);
+  assert.equal(app.hooks.getBlockHistory().length, 0);
+  assert.equal((await readStore(factory, "lookupQueue")).length, 0);
+  assert.equal((await readStore(factory, "blockHistory")).length, 0);
+};
+
 const run = async () => {
   await testHydrationPreservesAnotherTabsQueueWrite();
   await testHydrationPreservesAnotherTabsCacheWrite();
   await testHydrationPrunesAndRecoversInterruptedChecks();
   await testResetInvalidatesLatePersistentLookup();
   await testResetDuringHydrationClearsPersistentData();
+  await testHydrationKeepsConnectedViaFields();
+  await testLookupPersistsMetadataAcrossReloads();
+  await testHydrationSkipsUnchangedStorePuts();
+  await testClearQueueAndHistoryDuringHydrationAreNotResurrected();
 };
 run().then(() => console.log("LocaleFence IndexedDB checks passed")).catch((error) => {
   console.error(error);

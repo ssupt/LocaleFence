@@ -15,6 +15,8 @@ It is local-first: there is no LocaleFence server, analytics, or external data s
 ## Features
 
 - Show a country flag beside encountered X accounts.
+- Optionally match the app-store country from X's **Connected via** data (off by default), for hiding and automatic blocking when the reported location does not match.
+- Show X's **Connected via** label in the flag tooltip and mark its "location may not be accurate" warning beside the flag, even when the reported country is missing.
 - Select individual countries, X regions, or whole continents.
 - Hide matching posts without blocking their authors.
 - Optionally block matching accounts as their posts appear.
@@ -93,7 +95,13 @@ For debugging, connect Firefox Desktop through `about:debugging`, select the And
 2. Enable **Hide matching posts**, **Automatically block accounts**, or both.
 3. Use **Lookup queue** to inspect unresolved or failed checks. Removing an item cancels its block if the request has not started.
 4. Use **Block history** to review confirmed actions and open their triggering posts.
-5. Use **Settings** to enable notifications, choose their size and screen corner, inspect X's last reported lookup quota, or erase all LocaleFence data.
+5. Use **Settings** to enable notifications, choose their size and screen corner, match accounts by X's Connected-via store region, inspect X's last reported lookup quota, or erase all LocaleFence data.
+
+**Match Connected via store region** is off by default. When enabled, an account also matches when the app-store country in X's **Connected via** data is selected, even if the account's reported location is not. It applies to hiding and to automatic blocking, which still re-checks the account immediately before asking X to block it. Only recognized country-and-store labels count as store matches. The store region can be stale or belong to another country for reasons unrelated to location, so review it before enabling it for blocking.
+
+The flag tooltip shows the Connected-via label whenever X supplies it. A warning marker shows when X reports that the location may be inaccurate; that warning alone never hides or blocks anyone. If only the store country is available, its flag carries a **store** label. Accounts with a warning but no country show a globe and the warning marker. Cached records from older versions refresh on encounter to fetch this metadata.
+
+Country counts include store regions when matching is enabled. Each account counts once in the total, once per matching country, and once per continent. An account with two different countries can appear in both country rows.
 
 Automatic blocking remains enabled across X reloads until you turn it off. If a block request fails or times out, LocaleFence keeps the safety pause across reloads; turn blocking off and on only when you deliberately want to retry. Adding a location while blocking is active also requires confirmation because matching accounts already in the feed may be processed immediately.
 
@@ -115,8 +123,8 @@ LocaleFence reads only the X page content needed for its visible features and se
 It stores the following in browser storage associated with `x.com`:
 
 - selected locations, settings, exclusions, counters, pause state, remembered owner/account block IDs, quota telemetry, and a small cross-tab lookup cache in `localStorage`;
-- resolved account IDs, names, locations, and cache timestamps in IndexedDB;
-- pending lookup records and up to 250 confirmed block-history entries in IndexedDB.
+- resolved account IDs, names, locations, the Connected-via store label and its country, X's location-accuracy flag, and cache timestamps in IndexedDB;
+- pending lookup records and up to 250 confirmed block-history entries in IndexedDB, including whether each block matched the reported country or the store region.
 
 The individual clear controls remove their named datasets. **Settings → Reset LocaleFence** removes all LocaleFence browser data but does not undo blocks already held by X. Uninstalling the extension alone may leave `x.com` site data, so use Reset or clear X site data when complete deletion is wanted.
 
@@ -125,6 +133,7 @@ See the full [privacy policy](PRIVACY.md).
 ## Limitations
 
 - X account locations may be missing, broad, stale, or inaccurate.
+- The Connected-via store region can lag behind or differ from where an account currently connects, for example after a move or for accounts managed from several countries. X's location warning reports possible inaccuracy; it does not establish VPN or proxy use, and LocaleFence never hides or blocks on that warning alone.
 - Each previously unseen account requires an X About Account request. X does not publish the private endpoint's exact allowance, so long sessions can exhaust it even though LocaleFence caches and deduplicates results; queued checks resume after X's reported reset.
 - X's private web APIs can change without notice. LocaleFence can recover from query-identifier rotation, but schema or action-endpoint changes can still break features temporarily.
 - A timed-out action has an unknown server result, so automatic blocking pauses for review.
